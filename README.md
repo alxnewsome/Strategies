@@ -48,3 +48,21 @@ Overlay indicator for day trading NQ / MNQ. It calculates every widely watched i
 The table in the bottom-right lists the 3 nearest zones above and below price, with their distance in points.
 
 **Use a 1–5 minute chart.** The volume profile is built from the chart's bars, so lower timeframes give a more accurate POC and value area. All times are New York.
+
+## `rejection_block_signals.pine`: Rejection Block Confluence Signals (Pine Script v6)
+
+Gives buy and sell signals when a **rejection block** lines up with another setup. The signal candle is painted **bright yellow (#FFFF00)**, and its label lists the confluences, e.g. `BUY OB + RB + GC`.
+
+**Rejection block (RB):** the wick zone at a swing, measured from the lowest wick to the lowest candle body at a swing low (mirrored at a swing high). A *rejection candle* is one with a long wick (≥ 40% of its range and ≥ its body) that closes back in the trade direction.
+
+| Signal | Fires when |
+|---|---|
+| **GC / DC + RB** | A rejection candle retests an RB, OB or FVG while a golden cross is in force (50/200 SMA, cross within the last 100 bars by default). A death cross is used for sells |
+| **OB + RB** | A rejection candle taps an order block, so an RB forms inside the OB. OB = the last opposite candle at the extreme of the leg that broke the prior swing |
+| **FVG → RB** | Price taps a fair value gap and rejects out of it, forming an RB |
+| **RB retest** (optional, off by default) | A rejection candle retests a prior swing RB with no other confluence |
+
+- Raise `Minimum confluences` to 2+ to only get signals where several setups stack.
+- A zone is removed once price closes through its far side, or after it expires.
+- By default each zone can trigger only one signal.
+- Signals are final at bar close. Use the alerts, which fire once per bar close.

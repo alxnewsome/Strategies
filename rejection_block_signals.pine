@@ -1,0 +1,271 @@
+//@version=6
+indicator("Rejection Block Confluence Signals", shorttitle = "RB Signals", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_bars_back = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Core idea: a REJECTION BLOCK (RB) is the wick zone where price was pushed into
+// a level and rejected hard. ICT definition: at a swing low, from the lowest
+// wick up to the lowest candle body (mirrored at swing highs).
+//
+// A signal fires on a REJECTION CANDLE (long wick, close back in the trade
+// direction) when that wick forms or retests a rejection block in confluence with:
+//   • GC  — a golden cross (fast MA crossing above slow MA) is in force while
+//           price rejects off a block       (death cross "DC" for sells)
+//   • OB  — the rejection wick taps an order block (RB forms inside the OB)
+//   • FVG — the rejection wick taps a fair value gap (RB forms inside the FVG)
+//   • RB  — the rejection wick retests a prior swing rejection block
+// The signal candle is painted bright yellow; the label lists every confluence.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpSig = "Signal types"
+useGC     = input.bool(true,  "Golden / death cross + rejection block", group = grpSig)
+useOB     = input.bool(true,  "Order block + rejection block", group = grpSig)
+useFVG    = input.bool(true,  "FVG tapped → rejection block", group = grpSig)
+usePlain  = input.bool(false, "Plain rejection block retest (no other confluence)", group = grpSig)
+minConf   = input.int(1, "Minimum confluences (RB / OB / FVG / GC)", minval = 1, maxval = 4, group = grpSig, tooltip = "Raise to 2+ to only take signals where several setups line up.")
+cooldown  = input.int(3, "Min bars between signals (same side)", minval = 0, group = grpSig)
+onePerZone = input.bool(true, "Each zone can trigger only one signal", group = grpSig)
+
+grpRej = "Rejection candle"
+wickPct   = input.float(0.40, "Rejection wick ≥ % of candle range", minval = 0.1, maxval = 0.9, step = 0.05, group = grpRej)
+wickBody  = input.float(1.0,  "Rejection wick ≥ × body", minval = 0.0, step = 0.25, group = grpRej)
+closePos  = input.float(0.50, "Close in top/bottom % of range", minval = 0.1, maxval = 1.0, step = 0.05, group = grpRej, tooltip = "Buy: close must be in the upper part of the candle. 0.5 = upper half.")
+minRngAtr = input.float(0.50, "Min candle range (× ATR)", minval = 0.0, step = 0.1, group = grpRej, tooltip = "Filters out tiny dojis.")
+
+grpMA = "Golden / death cross"
+maType   = input.string("SMA", "MA type", options = ["SMA", "EMA"], group = grpMA)
+fastLen  = input.int(50,  "Fast MA", minval = 1, group = grpMA)
+slowLen  = input.int(200, "Slow MA", minval = 2, group = grpMA)
+gcMode   = input.string("Recent cross", "Cross alignment", options = ["Recent cross", "Fast above / below slow"], group = grpMA, tooltip = "Recent cross: the cross must have happened within the window below. Fast above/below slow: any time the MAs are stacked in the trade direction.")
+gcWindow = input.int(100, "Recent cross window (bars)", minval = 1, group = grpMA)
+showMA   = input.bool(true, "Plot MAs", group = grpMA)
+
+grpZ = "Zones"
+pivLen    = input.int(5, "Swing length (RB / structure)", minval = 1, group = grpZ)
+minRbAtr  = input.float(0.15, "Min RB wick size (× ATR)", minval = 0.0, step = 0.05, group = grpZ)
+obLook    = input.int(30, "Order block search back (bars)", minval = 2, maxval = 300, group = grpZ)
+minFvgAtr = input.float(0.10, "Min FVG size (× ATR)", minval = 0.0, step = 0.05, group = grpZ)
+maxAge    = input.int(300, "Zone expiry (bars)", minval = 10, group = grpZ)
+maxZones  = input.int(60, "Max zones tracked", minval = 5, maxval = 400, group = grpZ)
+showZones = input.bool(true, "Draw zones", group = grpZ)
+
+grpC = "Colors"
+sigCol    = input.color(#FFFF00, "Signal candle", group = grpC)
+buyCol    = input.color(#00c853, "Buy label", group = grpC)
+sellCol   = input.color(#d50000, "Sell label", group = grpC)
+rbBullCol = input.color(#26a69a, "Bullish RB", group = grpC)
+rbBearCol = input.color(#ef5350, "Bearish RB", group = grpC)
+obBullCol = input.color(#2962ff, "Bullish OB", group = grpC)
+obBearCol = input.color(#ff9800, "Bearish OB", group = grpC)
+fvgBullCol = input.color(#7e57c2, "Bullish FVG", group = grpC)
+fvgBearCol = input.color(#ab47bc, "Bearish FVG", group = grpC)
+
+// ── Core series ──────────────────────────────────────────────────────────────
+float atr = ta.atr(14)
+
+float smaF = ta.sma(close, fastLen)
+float smaS = ta.sma(close, slowLen)
+float emaF = ta.ema(close, fastLen)
+float emaS = ta.ema(close, slowLen)
+float maF  = maType == "SMA" ? smaF : emaF
+float maS  = maType == "SMA" ? smaS : emaS
+plot(showMA ? maF : na, "Fast MA", color.new(#ffd600, 40), 1)
+plot(showMA ? maS : na, "Slow MA", color.new(#90a4ae, 30), 2)
+
+bool gcUp   = ta.crossover(maF, maS)
+bool gcDn   = ta.crossunder(maF, maS)
+int  bsUp   = ta.barssince(gcUp)
+int  bsDn   = ta.barssince(gcDn)
+bool recent = gcMode == "Recent cross"
+bool gcBull = maF > maS and (not recent or (not na(bsUp) and bsUp <= gcWindow))
+bool gcBear = maF < maS and (not recent or (not na(bsDn) and bsDn <= gcWindow))
+
+// Rejection candles
+float rng   = high - low
+float body  = math.abs(close - open)
+float lWick = math.min(open, close) - low
+float uWick = high - math.max(open, close)
+bool  bigEnough = rng > 0 and rng >= minRngAtr * atr
+bool  rejBull = bigEnough and lWick >= wickPct * rng and lWick >= wickBody * body and close >= high - closePos * rng
+bool  rejBear = bigEnough and uWick >= wickPct * rng and uWick >= wickBody * body and close <= low + closePos * rng
+
+// ── Zones ────────────────────────────────────────────────────────────────────
+type Zone
+    float  top
+    float  bot
+    int    left
+    bool   bull
+    string kind      // "RB", "OB", "FVG"
+    bool   used = false
+    box    bx
+
+var array<Zone> zones = array.new<Zone>()
+
+zoneColor(bool bull, string kind) =>
+    kind == "RB" ? (bull ? rbBullCol : rbBearCol) : kind == "OB" ? (bull ? obBullCol : obBearCol) : (bull ? fvgBullCol : fvgBearCol)
+
+addZone(float top, float bot, int left, bool bull, string kind) =>
+    color c = zoneColor(bull, kind)
+    box b = showZones ? box.new(left, top, bar_index + 1, bot, border_color = color.new(c, 50), bgcolor = color.new(c, 85), text = kind, text_size = size.tiny, text_color = color.new(c, 20), text_halign = text.align_left, text_valign = bull ? text.align_bottom : text.align_top) : na
+    zones.push(Zone.new(top, bot, left, bull, kind, false, b))
+    if zones.size() > maxZones
+        Zone old = zones.shift()
+        old.bx.delete()
+
+// 1) Check this bar's rejection candle against zones that already exist.
+bool tRBbull  = false
+bool tOBbull  = false
+bool tFVGbull = false
+bool tRBbear  = false
+bool tOBbear  = false
+bool tFVGbear = false
+array<Zone> hitBull = array.new<Zone>()
+array<Zone> hitBear = array.new<Zone>()
+for z in zones
+    if onePerZone and z.used
+        continue
+    float mid = (z.top + z.bot) / 2
+    if z.bull and rejBull and low <= z.top and close > mid
+        hitBull.push(z)
+        switch z.kind
+            "RB"  => tRBbull  := true
+            "OB"  => tOBbull  := true
+            "FVG" => tFVGbull := true
+    if not z.bull and rejBear and high >= z.bot and close < mid
+        hitBear.push(z)
+        switch z.kind
+            "RB"  => tRBbear  := true
+            "OB"  => tOBbear  := true
+            "FVG" => tFVGbear := true
+
+// 2) Decide signals.
+bool anyBull = tRBbull or tOBbull or tFVGbull
+bool anyBear = tRBbear or tOBbear or tFVGbear
+int  confBull = (tRBbull ? 1 : 0) + (tOBbull ? 1 : 0) + (tFVGbull ? 1 : 0) + (anyBull and gcBull ? 1 : 0)
+int  confBear = (tRBbear ? 1 : 0) + (tOBbear ? 1 : 0) + (tFVGbear ? 1 : 0) + (anyBear and gcBear ? 1 : 0)
+
+bool setupBull = (useGC and gcBull and anyBull) or (useOB and tOBbull) or (useFVG and tFVGbull) or (usePlain and tRBbull)
+bool setupBear = (useGC and gcBear and anyBear) or (useOB and tOBbear) or (useFVG and tFVGbear) or (usePlain and tRBbear)
+
+var int lastBuy  = -100000
+var int lastSell = -100000
+bool buySig  = setupBull and confBull >= minConf and bar_index - lastBuy > cooldown
+bool sellSig = setupBear and confBear >= minConf and bar_index - lastSell > cooldown
+if buySig and sellSig            // conflicting two-sided wick: stand aside
+    buySig  := false
+    sellSig := false
+
+tags(bool rb, bool ob, bool fvg, bool crossOk, string crossTag) =>
+    array<string> t = array.new<string>()
+    if ob
+        t.push("OB")
+    if fvg
+        t.push("FVG")
+    if rb
+        t.push("RB")
+    if crossOk
+        t.push(crossTag)
+    t.join(" + ")
+
+string buyTags  = tags(tRBbull, tOBbull, tFVGbull, gcBull, "GC")
+string sellTags = tags(tRBbear, tOBbear, tFVGbear, gcBear, "DC")
+
+markUsed(array<Zone> hits) =>
+    for z in hits
+        z.used := true
+        if not na(z.bx)
+            z.bx.set_border_style(line.style_dashed)
+            z.bx.set_bgcolor(color.new(zoneColor(z.bull, z.kind), 93))
+
+if buySig
+    lastBuy := bar_index
+    markUsed(hitBull)
+    label.new(bar_index, low, "BUY\n" + buyTags, yloc = yloc.belowbar, style = label.style_label_up, color = buyCol, textcolor = color.white, size = size.small)
+    alert("RB BUY (" + buyTags + ") on " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if sellSig
+    lastSell := bar_index
+    markUsed(hitBear)
+    label.new(bar_index, high, "SELL\n" + sellTags, yloc = yloc.abovebar, style = label.style_label_down, color = sellCol, textcolor = color.white, size = size.small)
+    alert("RB SELL (" + sellTags + ") on " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+barcolor(buySig or sellSig ? sigCol : na, title = "Signal candle")
+
+// 3) Expire / invalidate zones (a close through the far side kills a zone).
+if zones.size() > 0
+    for i = zones.size() - 1 to 0
+        Zone z = zones.get(i)
+        bool dead = (z.bull ? close < z.bot : close > z.top) or bar_index - z.left > maxAge
+        if dead
+            z.bx.delete()
+            zones.remove(i)
+        else if not na(z.bx)
+            z.bx.set_right(bar_index + 1)
+
+// 4) Register new zones formed on this bar (they can be tapped from next bar on).
+
+// Rejection blocks at confirmed swings: lowest wick → lowest body of the swing cluster.
+float pl = ta.pivotlow(low, pivLen, pivLen)
+float ph = ta.pivothigh(high, pivLen, pivLen)
+if not na(pl)
+    float bodyLow = math.min(open[pivLen], close[pivLen])
+    for k = pivLen - 1 to pivLen + 1
+        bodyLow := math.min(bodyLow, math.min(open[k], close[k]))
+    if bodyLow - pl >= minRbAtr * atr[pivLen]
+        addZone(bodyLow, pl, bar_index - pivLen, true, "RB")
+if not na(ph)
+    float bodyHigh = math.max(open[pivLen], close[pivLen])
+    for k = pivLen - 1 to pivLen + 1
+        bodyHigh := math.max(bodyHigh, math.max(open[k], close[k]))
+    if ph - bodyHigh >= minRbAtr * atr[pivLen]
+        addZone(ph, bodyHigh, bar_index - pivLen, false, "RB")
+
+// Order blocks: on a close through the last swing (break of structure), the
+// last opposite candle at the extreme of the leg becomes the OB.
+var float lastPH = na
+var int   lastPHbar = na
+var bool  phLive = false
+var float lastPL = na
+var int   lastPLbar = na
+var bool  plLive = false
+if not na(ph)
+    lastPH    := ph
+    lastPHbar := bar_index - pivLen
+    phLive    := true
+if not na(pl)
+    lastPL    := pl
+    lastPLbar := bar_index - pivLen
+    plLive    := true
+
+if phLive and close > lastPH
+    phLive := false
+    int   n    = math.min(bar_index - lastPHbar, obLook)
+    float minL = na
+    int   obK  = na
+    for k = 1 to n
+        if close[k] < open[k] and (na(minL) or low[k] < minL)
+            minL := low[k]
+            obK  := k
+    if not na(obK)
+        addZone(high[obK], low[obK], bar_index - obK, true, "OB")
+if plLive and close < lastPL
+    plLive := false
+    int   n    = math.min(bar_index - lastPLbar, obLook)
+    float maxH = na
+    int   obK  = na
+    for k = 1 to n
+        if close[k] > open[k] and (na(maxH) or high[k] > maxH)
+            maxH := high[k]
+            obK  := k
+    if not na(obK)
+        addZone(high[obK], low[obK], bar_index - obK, false, "OB")
+
+// Fair value gaps (3-candle imbalance).
+if low > high[2] and close[1] > high[2] and low - high[2] >= minFvgAtr * atr
+    addZone(low, high[2], bar_index - 2, true, "FVG")
+if high < low[2] and close[1] < low[2] and low[2] - high >= minFvgAtr * atr
+    addZone(low[2], high, bar_index - 2, false, "FVG")
+
+// ── Alerts ───────────────────────────────────────────────────────────────────
+alertcondition(buySig,  "RB Buy",  "Rejection block BUY on {{ticker}} @ {{close}}")
+alertcondition(sellSig, "RB Sell", "Rejection block SELL on {{ticker}} @ {{close}}")
+plot(buySig ? 1 : sellSig ? -1 : 0, "Signal (1 buy / -1 sell)", display = display.data_window)
