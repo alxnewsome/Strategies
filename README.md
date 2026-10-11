@@ -66,3 +66,18 @@ Gives buy and sell signals when a **rejection block** lines up with another setu
 - A zone is removed once price closes through its far side, or after it expires.
 - By default each zone can trigger only one signal.
 - Signals are final at bar close. Use the alerts, which fire once per bar close.
+
+## `chase_buy_sell_add_enhanced.pine`: Chase's BUY/SELL + ADD, enhanced (Pine Script v6)
+
+An improved version of Chase's indicator. It keeps the same defaults (SMA 70 cross, RSI 14 at 80/20, ADD in its own pane). Changes:
+
+- **ADD confirms signals.** Buys need ADD above its 10-period MA; sells need it below. Other modes: also rising/falling, zero line, or off. Reversals need ADD turning. A reversal is graded `REV+` when ADD was beyond ±1000.
+- **Bug fixes.**
+  - The cross is checked on the correct bar. The original compared `close[1]` against the *current* SMA.
+  - Buy and sell are symmetric. Sell used `low` while buy used `close`.
+  - Down reversals need a red candle, matching up reversals.
+- **Fewer false crosses.** There's an ATR buffer around the SMA, and the indicator only registers a new cross after price has closed clearly on the other side. The cross candle's high or low must then be broken within 3 bars (not only the next bar).
+- **RTH-only filter** (on by default). ADD only exists 09:30–16:00 ET.
+- **Layout.** Signals, the SMA and bar colors draw on the price chart via `force_overlay`. ADD stays in its pane with zero and ±extreme lines.
+- **Scorecard.** Each signal is graded on whether it hit a 2×ATR target before a 1×ATR stop. Win rate is shown per signal type, along with the breakeven win rate, so you can tune settings with real feedback.
+- **Optional filters.** SMA slope, and above-average volume.
