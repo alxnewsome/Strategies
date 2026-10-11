@@ -1,0 +1,272 @@
+//@version=6
+indicator("3-Touch Trend Lines + Volume Breakouts", shorttitle = "TL 3-Touch", overlay = true, max_lines_count = 500, max_labels_count = 500, max_bars_back = 2000)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Concept
+//  • A trend line is VALID once it has at least 3 touch points (confirmed pivots
+//    within a small ATR tolerance of the line).
+//  • A candle closing past the line does NOT invalidate it if price closes back
+//    inside within `Max closes outside` bars. That is a false break / reclaim.
+//  • Continuation signals: price tags the line and closes back in the trend
+//    direction (bounce off support or rejection from resistance), or price
+//    reclaims the line after a false break.
+//  • Breakout signals: a close beyond the line (past a small ATR buffer) WITH a
+//    volume spike. A break with no volume spike is only "unconfirmed". If it
+//    stays outside too long with no spike, the line is invalidated and no
+//    signal is given.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpP = "Pivots & trend lines"
+pivLeft      = input.int(5, "Pivot left bars", minval = 1, group = grpP)
+pivRight     = input.int(5, "Pivot right bars", minval = 1, group = grpP, tooltip = "A pivot is confirmed this many bars after it prints. Lower = faster but noisier.")
+minTouches   = input.int(3, "Minimum touches for a valid line", minval = 3, maxval = 10, group = grpP)
+maxPivots    = input.int(12, "Pivots kept per side", minval = 3, maxval = 30, group = grpP)
+maxLookback  = input.int(500, "Max line age (bars)", minval = 50, maxval = 1900, group = grpP)
+touchTolAtr  = input.float(0.25, "Touch tolerance (× ATR)", minval = 0.0, step = 0.05, group = grpP, tooltip = "How close a pivot has to be to the line to count as a touch.")
+requireSlope = input.bool(true, "Support must rise / resistance must fall", group = grpP, tooltip = "On: only true trend lines (rising support under an uptrend, falling resistance over a downtrend). Off: flat or counter-sloped lines are allowed too.")
+atrLen       = input.int(14, "ATR length", minval = 1, group = grpP)
+
+grpB = "False breaks & breakouts"
+breakBufAtr = input.float(0.10, "Break buffer (× ATR)", minval = 0.0, step = 0.05, group = grpB, tooltip = "A close must be this far past the line to count as outside it.")
+maxOutside  = input.int(2, "Max closes outside before the line is invalid", minval = 0, group = grpB, tooltip = "If price closes back inside within this many closes outside, the line stays valid (false break). With no volume spike, one more close outside invalidates the line.")
+volLen      = input.int(20, "Volume average length", minval = 1, group = grpB)
+volMult     = input.float(1.8, "Volume spike (× average)", minval = 1.0, step = 0.1, group = grpB, tooltip = "A breakout is confirmed only if a close outside the line also has volume at or above this multiple of the average. Symbols with no volume data never confirm a breakout.")
+
+grpS = "Signals"
+needCandle  = input.bool(true, "Continuation needs a candle in the trend direction", group = grpS)
+cooldown    = input.int(5, "Min bars between continuation signals", minval = 0, group = grpS)
+showUnconf  = input.bool(true, "Mark unconfirmed (low-volume) breaks", group = grpS)
+showFail    = input.bool(true, "Mark lines invalidated without volume", group = grpS)
+
+grpD = "Display"
+showTouches = input.bool(true, "Mark touch points", group = grpD)
+keepBroken  = input.bool(true, "Keep broken lines on chart", group = grpD)
+showTable   = input.bool(true, "Show status table", group = grpD)
+supCol      = input.color(color.new(#26a69a, 0), "Uptrend (support) line", group = grpD)
+resCol      = input.color(color.new(#ef5350, 0), "Downtrend (resistance) line", group = grpD)
+brokenCol   = input.color(color.new(color.gray, 40), "Broken / invalid line", group = grpD)
+
+// ── Core series ──────────────────────────────────────────────────────────────
+float atr      = ta.atr(atrLen)
+float tol      = atr * touchTolAtr
+float buf      = atr * breakBufAtr
+float volAvg   = ta.sma(volume, volLen)
+bool  volSpike = not na(volAvg) and volume >= volAvg * volMult
+
+float pl = ta.pivotlow(low, pivLeft, pivRight)
+float ph = ta.pivothigh(high, pivLeft, pivRight)
+
+var array<int>   supX = array.new<int>()
+var array<float> supY = array.new<float>()
+var array<int>   resX = array.new<int>()
+var array<float> resY = array.new<float>()
+
+// ── Trend line object ────────────────────────────────────────────────────────
+type TL
+    bool         isSupport
+    bool         active    = false
+    int          x1
+    float        y1
+    float        slope
+    int          touches   = 0
+    int          outside   = 0        // consecutive closes beyond the line (pending break)
+    int          lastSig   = -100000
+    int          lastBreak = -1       // bar of last volume-confirmed break; new lines must start after it
+    line         ln
+    array<label> marks
+
+method yAt(TL t, int x) =>
+    t.y1 + t.slope * (x - t.x1)
+
+// Retire the line: freeze it where it is, restyle it, and stop tracking it.
+method retire(TL t) =>
+    t.ln.set_xy2(bar_index, t.yAt(bar_index))
+    if keepBroken
+        t.ln.set_color(brokenCol)
+        t.ln.set_style(line.style_dashed)
+    else
+        t.ln.delete()
+        for lb in t.marks
+            lb.delete()
+    t.ln      := na
+    t.marks   := array.new<label>()
+    t.active  := false
+    t.outside := 0
+
+// Redraw the line and its touch markers.
+method draw(TL t, array<int> xs, array<float> ys) =>
+    t.ln.delete()
+    for lb in t.marks
+        lb.delete()
+    t.marks.clear()
+    color c = t.isSupport ? supCol : resCol
+    t.ln := line.new(t.x1, t.y1, bar_index, t.yAt(bar_index), color = c, width = 2)
+    if showTouches
+        for [k, x] in xs
+            float y = ys.get(k)
+            if x >= t.x1 and math.abs(y - t.yAt(x)) <= tol
+                t.marks.push(label.new(x, y, "", style = label.style_circle, size = size.tiny, color = c))
+
+// Search every pair of stored pivots for the best valid line:
+//  ≥ minTouches pivots within `tol`, never more than `maxOutside` consecutive
+//  closes beyond it (false breaks allowed), and currently inside it.
+//  Best = most touches, then the most recent touch.
+findLine(array<int> xs, array<float> ys, bool isSupport, int notBefore) =>
+    int   bx1     = na
+    float by1     = na
+    float bm      = na
+    int   bTouch  = 0
+    int   bLast   = -1
+    int   n       = xs.size()
+    if n >= minTouches
+        for i = 0 to n - 2
+            int xi = xs.get(i)
+            if xi <= notBefore or bar_index - xi > maxLookback
+                continue
+            float yi = ys.get(i)
+            for j = i + 1 to n - 1
+                float m = (ys.get(j) - yi) / (xs.get(j) - xi)
+                if requireSlope and (isSupport ? m <= 0 : m >= 0)
+                    continue
+                int touches = 0
+                int last    = xi
+                for k = i to n - 1
+                    int xk = xs.get(k)
+                    if math.abs(ys.get(k) - (yi + m * (xk - xi))) <= tol
+                        touches += 1
+                        last    := xk
+                if touches < minTouches or touches < bTouch or (touches == bTouch and last <= bLast)
+                    continue
+                int  cons = 0
+                bool ok   = true
+                for off = bar_index - xi to 0
+                    float lv  = yi + m * (bar_index - off - xi)
+                    bool  out = isSupport ? close[off] < lv - buf : close[off] > lv + buf
+                    cons := out ? cons + 1 : 0
+                    if cons > maxOutside
+                        ok := false
+                        break
+                if ok and cons == 0
+                    bx1    := xi
+                    by1    := yi
+                    bm     := m
+                    bTouch := touches
+                    bLast  := last
+    [bx1, by1, bm, bTouch]
+
+// Per-bar evaluation of an active line. Returns
+// [continuation, reclaim, confirmed breakout, invalidated, unconfirmed break].
+method update(TL t) =>
+    bool cont    = false
+    bool reclaim = false
+    bool brk     = false
+    bool fail    = false
+    bool unconf  = false
+    if t.active
+        float lv = t.yAt(bar_index)
+        t.ln.set_xy2(bar_index, lv)
+        bool beyond   = t.isSupport ? close < lv - buf : close > lv + buf
+        bool inside   = t.isSupport ? close > lv : close < lv
+        bool candleOk = not needCandle or (t.isSupport ? close > open : close < open)
+        if beyond
+            t.outside := t.outside + 1
+            if volSpike
+                brk         := true
+                t.lastBreak := bar_index
+                t.retire()
+            else if t.outside > maxOutside
+                fail := true
+                t.retire()
+            else if t.outside == 1
+                unconf := true
+        else if t.outside > 0
+            // Back inside after a false break: the line survives.
+            if inside
+                t.outside := 0
+                if candleOk
+                    reclaim   := true
+                    t.lastSig := bar_index
+        else
+            bool touched = t.isSupport ? low <= lv + tol : high >= lv - tol
+            if touched and inside and candleOk and bar_index - t.lastSig > cooldown
+                cont      := true
+                t.lastSig := bar_index
+    [cont, reclaim, brk, fail, unconf]
+
+// Store a newly confirmed pivot and look for a (better) line.
+method onPivot(TL t, array<int> xs, array<float> ys, float price) =>
+    xs.push(bar_index - pivRight)
+    ys.push(price)
+    while xs.size() > maxPivots or (xs.size() > 0 and bar_index - xs.first() > maxLookback)
+        xs.shift()
+        ys.shift()
+    // Don't swap lines while the current one is in the middle of a possible break.
+    if t.outside == 0
+        [x1, y1, m, nT] = findLine(xs, ys, t.isSupport, t.lastBreak)
+        if not na(x1)
+            t.x1      := x1
+            t.y1      := y1
+            t.slope   := m
+            t.touches := nT
+            t.active  := true
+            t.draw(xs, ys)
+
+var TL sup = TL.new(isSupport = true,  marks = array.new<label>())
+var TL res = TL.new(isSupport = false, marks = array.new<label>())
+
+// Evaluate existing lines on this bar first, then fold in any new pivot.
+[supCont, supReclaim, supBreak, supFail, supUnconf] = sup.update()
+[resCont, resReclaim, resBreak, resFail, resUnconf] = res.update()
+
+if not na(pl)
+    sup.onPivot(supX, supY, pl)
+if not na(ph)
+    res.onPivot(resX, resY, ph)
+
+// ── Entry signals ────────────────────────────────────────────────────────────
+//  LONG : bounce off uptrend support, reclaim of support after a false break,
+//         or a volume-confirmed breakout above downtrend resistance.
+//  SHORT: rejection at downtrend resistance, loss of resistance after a false
+//         break, or a volume-confirmed breakdown below uptrend support.
+bool longTrend    = supCont or supReclaim
+bool shortTrend   = resCont or resReclaim
+bool longBreakout = resBreak
+bool shortBreakout = supBreak
+bool longEntry    = longTrend or longBreakout
+bool shortEntry   = shortTrend or shortBreakout
+
+plotshape(supCont,    "Long: uptrend bounce",          shape.triangleup,   location.belowbar, color.new(#26a69a, 0), size = size.small, text = "TL",  textcolor = #26a69a)
+plotshape(supReclaim, "Long: reclaim after false break", shape.triangleup, location.belowbar, color.new(#00897b, 0), size = size.small, text = "RC",  textcolor = #00897b)
+plotshape(resBreak,   "Long: volume breakout",          shape.labelup,      location.belowbar, color.new(#00c853, 0), size = size.small, text = "BO",  textcolor = color.white)
+plotshape(resCont,    "Short: downtrend rejection",     shape.triangledown, location.abovebar, color.new(#ef5350, 0), size = size.small, text = "TL",  textcolor = #ef5350)
+plotshape(resReclaim, "Short: reject after false break", shape.triangledown, location.abovebar, color.new(#c62828, 0), size = size.small, text = "RC", textcolor = #c62828)
+plotshape(supBreak,   "Short: volume breakdown",        shape.labeldown,    location.abovebar, color.new(#d50000, 0), size = size.small, text = "BD",  textcolor = color.white)
+plotshape(showUnconf and supUnconf, "Unconfirmed break (support)",    shape.xcross, location.belowbar, color.new(color.gray, 0), size = size.tiny)
+plotshape(showUnconf and resUnconf, "Unconfirmed break (resistance)", shape.xcross, location.abovebar, color.new(color.gray, 0), size = size.tiny)
+plotshape(showFail and supFail, "Support invalidated (no volume)",    shape.circle, location.belowbar, color.new(color.gray, 0), size = size.tiny, text = "no vol", textcolor = color.gray)
+plotshape(showFail and resFail, "Resistance invalidated (no volume)", shape.circle, location.abovebar, color.new(color.gray, 0), size = size.tiny, text = "no vol", textcolor = color.gray)
+
+// Hidden series so strategies / other scripts can read the signals.
+plot(longEntry  ? 1 : 0, "Long entry",  display = display.data_window)
+plot(shortEntry ? 1 : 0, "Short entry", display = display.data_window)
+
+// ── Alerts ───────────────────────────────────────────────────────────────────
+alertcondition(longEntry,     "Any long entry",            "Trend line LONG entry on {{ticker}} @ {{close}}")
+alertcondition(shortEntry,    "Any short entry",           "Trend line SHORT entry on {{ticker}} @ {{close}}")
+alertcondition(longTrend,     "Long: trend continuation",  "Uptrend line held on {{ticker}} @ {{close}}")
+alertcondition(shortTrend,    "Short: trend continuation", "Downtrend line held on {{ticker}} @ {{close}}")
+alertcondition(longBreakout,  "Long: volume breakout",     "Downtrend line broken UP with volume on {{ticker}} @ {{close}}")
+alertcondition(shortBreakout, "Short: volume breakdown",   "Uptrend line broken DOWN with volume on {{ticker}} @ {{close}}")
+
+// ── Status table ─────────────────────────────────────────────────────────────
+var table info = table.new(position.top_right, 2, 3, bgcolor = color.new(color.black, 80), border_width = 1)
+statusText(TL t) =>
+    not t.active ? "none" : str.tostring(t.touches) + " touches" + (t.outside > 0 ? " · testing break (" + str.tostring(t.outside) + "/" + str.tostring(maxOutside) + ")" : " · holding")
+if showTable and barstate.islast
+    info.cell(0, 0, "Line",              text_color = color.white, text_size = size.small)
+    info.cell(1, 0, "Status",            text_color = color.white, text_size = size.small)
+    info.cell(0, 1, "Uptrend support",   text_color = supCol,      text_size = size.small)
+    info.cell(1, 1, statusText(sup),     text_color = color.white, text_size = size.small)
+    info.cell(0, 2, "Downtrend resist.", text_color = resCol,      text_size = size.small)
+    info.cell(1, 2, statusText(res),     text_color = color.white, text_size = size.small)
