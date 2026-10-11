@@ -1,0 +1,164 @@
+//@version=6
+strategy("NQ Trend Pullback — Sweep & Reclaim", shorttitle = "NQ TPB", overlay = true, pyramiding = 2, initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.cash_per_contract, commission_value = 2.5, slippage = 1, max_bars_back = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WHY THIS IS BUILT FOR A HIGH WIN RATE
+//  • Only trade WITH the bigger trend (1h EMA rising + price above VWAP for
+//    longs). Pullbacks in a trend resolve in the trend's direction more often
+//    than not.
+//  • Only buy a DIP that has already been flushed: 2-period RSI deeply oversold
+//    AND a sweep of a recent low (stops taken) or a VWAP tag, then a candle
+//    that closes back above it (reclaim). Weak hands are already out.
+//  • First target is close (1R) and half the position is taken there. The
+//    stop then moves to breakeven, so most trades that reach 1R can't lose.
+//  • Only trade the cleanest hours (09:45–11:30, 13:30–15:30 ET), max 3 trades
+//    a day, stop after 2 losing trades, flat by 15:55.
+// Shorts are the exact mirror image.
+//
+// Run it in TradingView's Strategy Tester (NQ1! or MNQ1!, 5-minute chart) to
+// see the real win rate, profit factor and drawdown. Commission ($2.50/contract
+// per side) and 1 tick of slippage are already included.
+// ─────────────────────────────────────────────────────────────────────────────
+
+string TZ = "America/New_York"
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpT = "Trend filter"
+htfTf   = input.timeframe("60", "Higher-timeframe trend", group = grpT)
+htfLen  = input.int(50, "HTF EMA length", minval = 1, group = grpT)
+useVwap = input.bool(true, "Longs above VWAP / shorts below", group = grpT)
+
+grpE = "Entry"
+pullMode = input.string("Either", "Pullback type", options = ["Sweep of recent low/high", "VWAP tag", "Either"], group = grpE)
+sweepLen = input.int(10, "Sweep lookback (bars)", minval = 2, group = grpE)
+rsiLo    = input.float(15, "RSI(2) oversold (longs)", minval = 1, maxval = 50, group = grpE)
+rsiHi    = input.float(85, "RSI(2) overbought (shorts)", minval = 50, maxval = 99, group = grpE)
+rsiLook  = input.int(3, "RSI extreme within (bars)", minval = 1, group = grpE)
+
+grpR = "Risk & exits"
+stopBuf  = input.float(0.10, "Stop buffer beyond signal candle (× ATR)", minval = 0.0, step = 0.05, group = grpR)
+minRisk  = input.float(0.30, "Min stop distance (× ATR)", minval = 0.0, step = 0.05, group = grpR)
+maxRisk  = input.float(1.50, "Max stop distance (× ATR)", minval = 0.1, step = 0.1, group = grpR)
+t1R      = input.float(1.0, "Target 1 (R)", minval = 0.25, step = 0.25, group = grpR)
+t2R      = input.float(2.0, "Target 2 (R)", minval = 0.25, step = 0.25, group = grpR)
+qty1     = input.int(1, "Contracts at target 1", minval = 1, group = grpR)
+qty2     = input.int(1, "Contracts at target 2 (runner)", minval = 0, group = grpR)
+moveBE   = input.bool(true, "Move runner stop to breakeven after target 1", group = grpR)
+
+grpS = "Session & limits"
+win1      = input.session("0945-1130", "Trading window 1 (ET)", group = grpS)
+win2      = input.session("1330-1530", "Trading window 2 (ET)", group = grpS)
+flatSess  = input.session("1555-1600", "Flatten all (ET)", group = grpS)
+maxTrades = input.int(3, "Max trades per day", minval = 1, group = grpS)
+maxLosses = input.int(2, "Stop trading after N losing trades", minval = 1, group = grpS)
+allowLong  = input.bool(true, "Take longs", group = grpS)
+allowShort = input.bool(true, "Take shorts", group = grpS)
+
+// ── Core series ──────────────────────────────────────────────────────────────
+inSess(string s) => not na(time(timeframe.period, s, TZ))
+
+bool  inRTH    = inSess("0930-1600")
+bool  rthStart = inRTH and not inRTH[1]
+bool  inWindow = inSess(win1) or inSess(win2)
+bool  flatNow  = inSess(flatSess)
+
+float atr  = ta.atr(14)
+float vw   = ta.vwap(hlc3, rthStart)
+float rsi2 = ta.rsi(close, 2)
+
+[hE1, hE2] = request.security(syminfo.tickerid, htfTf, [ta.ema(close, htfLen)[1], ta.ema(close, htfLen)[2]], lookahead = barmerge.lookahead_on)
+bool trendUp = close > hE1 and hE1 > hE2
+bool trendDn = close < hE1 and hE1 < hE2
+
+bool dip = ta.lowest(rsi2, rsiLook) < rsiLo
+bool pop = ta.highest(rsi2, rsiLook) > rsiHi
+
+float priorLow  = ta.lowest(low, sweepLen)[1]
+float priorHigh = ta.highest(high, sweepLen)[1]
+bool sweepLong  = low < priorLow and close > priorLow
+bool sweepShort = high > priorHigh and close < priorHigh
+bool vwapLong   = low <= vw and close > vw
+bool vwapShort  = high >= vw and close < vw
+bool pullLong   = pullMode == "Sweep of recent low/high" ? sweepLong  : pullMode == "VWAP tag" ? vwapLong  : sweepLong or vwapLong
+bool pullShort  = pullMode == "Sweep of recent low/high" ? sweepShort : pullMode == "VWAP tag" ? vwapShort : sweepShort or vwapShort
+
+float longStop  = low - stopBuf * atr
+float shortStop = high + stopBuf * atr
+float longRisk  = close - longStop
+float shortRisk = shortStop - close
+
+// ── Daily limits ─────────────────────────────────────────────────────────────
+var int   tradesToday = 0
+var int   lossesToday = 0
+var float netAtEntry  = 0.0
+if rthStart
+    tradesToday := 0
+    lossesToday := 0
+if strategy.position_size == 0 and strategy.position_size[1] != 0 and strategy.netprofit < netAtEntry
+    lossesToday += 1
+bool canTrade = inWindow and strategy.position_size == 0 and tradesToday < maxTrades and lossesToday < maxLosses
+
+// ── Signals ──────────────────────────────────────────────────────────────────
+bool longSig  = allowLong and canTrade and trendUp and (not useVwap or close > vw) and dip and pullLong and close > open and longRisk >= minRisk * atr and longRisk <= maxRisk * atr
+bool shortSig = allowShort and canTrade and trendDn and (not useVwap or close < vw) and pop and pullShort and close < open and shortRisk >= minRisk * atr and shortRisk <= maxRisk * atr
+if longSig and shortSig
+    longSig  := false
+    shortSig := false
+
+// ── Orders ───────────────────────────────────────────────────────────────────
+var float stopPx = na
+int qtyTotal = qty1 + qty2
+
+placeExits(bool isLong, float entry) =>
+    float r  = math.abs(entry - stopPx)
+    float d  = isLong ? 1.0 : -1.0
+    float tp1 = entry + d * t1R * r
+    float tp2 = entry + d * t2R * r
+    bool  t1Done = math.abs(strategy.position_size) > 0 and math.abs(strategy.position_size) < qtyTotal
+    float runnerStop = t1Done and moveBE ? entry : stopPx
+    strategy.exit(isLong ? "XL1" : "XS1", isLong ? "L1" : "S1", stop = stopPx, limit = tp1)
+    if qty2 > 0
+        strategy.exit(isLong ? "XL2" : "XS2", isLong ? "L2" : "S2", stop = runnerStop, limit = tp2)
+    [tp1, tp2, runnerStop]
+
+if longSig
+    stopPx      := longStop
+    netAtEntry  := strategy.netprofit
+    tradesToday += 1
+    strategy.entry("L1", strategy.long, qty = qty1)
+    if qty2 > 0
+        strategy.entry("L2", strategy.long, qty = qty2)
+    [l1, l2, l3] = placeExits(true, close)
+if shortSig
+    stopPx      := shortStop
+    netAtEntry  := strategy.netprofit
+    tradesToday += 1
+    strategy.entry("S1", strategy.short, qty = qty1)
+    if qty2 > 0
+        strategy.entry("S2", strategy.short, qty = qty2)
+    [s1, s2, s3] = placeExits(false, close)
+
+float tp1Plot = na
+float tp2Plot = na
+float stPlot  = na
+if strategy.position_size != 0
+    [a, b, c] = placeExits(strategy.position_size > 0, strategy.position_avg_price)
+    tp1Plot := a
+    tp2Plot := b
+    stPlot  := c
+    if flatNow
+        strategy.close_all("EOD flat")
+
+// ── Visuals ──────────────────────────────────────────────────────────────────
+plot(vw,  "VWAP", color.new(#00bcd4, 0), 2)
+plot(hE1, "HTF EMA", color.new(#ff9800, 30), 2, plot.style_stepline)
+plot(stPlot,  "Stop",     color.new(#f23645, 0), 2, plot.style_linebr)
+plot(tp1Plot, "Target 1", color.new(#089981, 0), 1, plot.style_linebr)
+plot(tp2Plot, "Target 2", color.new(#089981, 0), 2, plot.style_linebr)
+bgcolor(inWindow ? color.new(color.blue, 94) : na, title = "Trading window")
+barcolor(longSig or shortSig ? #FFFF00 : na, title = "Signal candle")
+plotshape(longSig,  "Long",  shape.labelup,   location.belowbar, color.new(#089981, 0), text = "LONG",  textcolor = color.white, size = size.small)
+plotshape(shortSig, "Short", shape.labeldown, location.abovebar, color.new(#f23645, 0), text = "SHORT", textcolor = color.white, size = size.small)
+
+alertcondition(longSig,  "Long signal",  "NQ TPB LONG on {{ticker}} @ {{close}}")
+alertcondition(shortSig, "Short signal", "NQ TPB SHORT on {{ticker}} @ {{close}}")

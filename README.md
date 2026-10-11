@@ -82,3 +82,20 @@ Drawn on the chart: the rejection block box with a dashed midpoint line, red sto
 Alerts:
 - **Setup armed:** a new rejection block, with the limit and stop prices.
 - **Entry filled.**
+
+## `nq_trend_pullback_strategy.pine`: NQ Trend Pullback, Sweep & Reclaim (Pine Script v6 **strategy**)
+
+A backtestable strategy built for a high win rate. Run it in TradingView's **Strategy Tester** on NQ1! or MNQ1!, 5-minute chart. Commission ($2.50/contract/side) and 1 tick of slippage are included.
+
+**Long rules** (shorts are the mirror image):
+1. **Trend:** the 1h 50 EMA is rising, price is above it, and price is above RTH VWAP.
+2. **Flush:** the 2-period RSI dropped below 15 within the last 3 bars.
+3. **Pullback:** price sweeps the 10-bar low or tags VWAP, and the candle closes back above it as a green candle. The signal candle is painted yellow.
+4. **Stop:** signal candle low − 0.1 ATR. The trade is skipped if the stop is < 0.3 or > 1.5 ATR away.
+5. **Exits:** half the position comes off at 1R. The runner's stop then moves to breakeven, and the runner targets 2R.
+6. **Limits:**
+   - Entries only 09:45–11:30 and 13:30–15:30 ET.
+   - Max 3 trades/day, and no more trades after 2 losing trades.
+   - Flat by 15:55.
+
+Each leg (L1/L2) shows as its own trade in the Strategy Tester's list of trades.
