@@ -28,3 +28,23 @@ The `Long entry` / `Short entry` series (1/0) are exposed in the data window for
 ### Notes
 - Pivots are confirmed `Pivot right bars` after they print, so a line becomes active with that delay. Signals on the active line are real-time and do not repaint after the bar closes.
 - Symbols with no volume data, such as some FX/index feeds, will never confirm a breakout.
+
+## `nq_key_levels.pine`: NQ Key Levels, ranked by confluence (Pine Script v6)
+
+Overlay indicator for day trading NQ / MNQ. It calculates every widely watched intraday reference level, gives each one a weight, and merges levels that sit within a few points of each other into one zone. A zone's score is the sum of its weights. Stronger zones are drawn heavier and get more stars. Only zones near price that reach `Minimum score to draw` (default 2) are shown, so lone minor levels only appear when they line up with something else.
+
+| Group | Levels (weight) |
+|---|---|
+| Higher timeframe | Prior month H/L (4), prior week H/L (3), week open (2) |
+| Prior day | RTH high/low (3), RTH close / gap fill (2), prior Globex H/L (1) |
+| Overnight & opens | Overnight high/low (3), RTH open (2), Globex 18:00 open (1), midnight open (1) |
+| Volume profile (RTH) | Prior POC (3), prior VAH/VAL (2), naked (untested) POCs (3), developing POC (2) |
+| Initial balance | IB high/low (2), IB ±50% / ±100% extensions (1), opening range H/L (1) |
+| Sessions | London H/L (2), Asia H/L (1) |
+| VWAP | VWAP (2), ±2σ bands (1). Anchored at RTH open or Globex open |
+| Volatility | VXN-implied 1σ daily move from prior close (2), ADR exhaustion targets (1) |
+| Round numbers | 1000s (3), 500s (2), 100s (1) |
+
+The table in the bottom-right lists the 3 nearest zones above and below price, with their distance in points.
+
+**Use a 1–5 minute chart.** The volume profile is built from the chart's bars, so lower timeframes give a more accurate POC and value area. All times are New York.

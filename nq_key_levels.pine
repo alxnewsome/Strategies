@@ -1,0 +1,458 @@
+//@version=6
+indicator("NQ Key Levels — Confluence Ranked", shorttitle = "NQ Levels", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 200, max_bars_back = 5000)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Every level a futures day trader watches is calculated, scored, and then
+// merged when several levels sit within a few points of each other. Levels that
+// stack up (e.g. PDH + ONH + weekly high + a round number) score higher and are
+// drawn heavier. Only levels within reach of price today are shown, so the
+// chart stays readable.
+//
+// Sources (weights in brackets):
+//   Prior month H/L [4] · prior week H/L [3] · week open [2]
+//   Prior RTH day H/L [3] · prior RTH close / gap-fill [2] · prior Globex H/L [1]
+//   Overnight (Globex) H/L [3] · Globex open [1] · midnight open [1] · RTH open [2]
+//   Prior-day volume profile POC [3] / VAH, VAL [2] · naked POCs [3] · developing POC [2]
+//   Initial balance H/L [2] + 50% / 100% extensions [1] · opening range H/L [1]
+//   Asia H/L [1] · London H/L [2]
+//   VWAP [2] · VWAP ±2σ [1]
+//   VXN-implied 1σ daily move from prior close [2] · ADR exhaustion targets [1]
+//   Round numbers: 1000s [3] · 500s [2] · 100s [1]
+// Times are New York. Built for NQ / MNQ (CME, Globex day starts 18:00 ET).
+// Use a 1–5 minute chart for an accurate volume profile.
+// ─────────────────────────────────────────────────────────────────────────────
+
+if not timeframe.isintraday
+    runtime.error("NQ Key Levels needs an intraday chart (1–15 minute recommended).")
+
+string TZ = "America/New_York"
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpF = "Filtering & confluence"
+minScore    = input.int(2, "Minimum score to draw", minval = 1, group = grpF, tooltip = "A level (or cluster) is drawn only if its summed weight reaches this. 1 = everything, 2 = default, 4 = only the strongest.")
+rangeAtr    = input.float(1.2, "Show levels within (× daily ATR) of price", minval = 0.2, step = 0.1, group = grpF)
+clusterPts  = input.float(0.0, "Cluster distance in points (0 = auto)", minval = 0.0, step = 1.0, group = grpF, tooltip = "Levels closer together than this are merged into one zone. Auto = 4% of daily ATR (~12–16 pts on NQ).")
+rightPad    = input.int(12, "Label offset (bars right of price)", minval = 0, group = grpF)
+
+grpS = "Sessions (New York time)"
+rthSess   = input.session("0930-1600", "RTH session", group = grpS)
+ibSess    = input.session("0930-1030", "Initial balance", group = grpS)
+orMins    = input.int(15, "Opening range (minutes)", minval = 1, maxval = 60, group = grpS)
+asiaSess  = input.session("2000-2359", "Asia session", group = grpS)
+londSess  = input.session("0200-0500", "London session", group = grpS)
+
+grpP = "Volume profile"
+rowSize   = input.float(5.0, "Row size (points)", minval = 0.25, step = 0.25, group = grpP)
+vaPct     = input.float(70.0, "Value area %", minval = 50, maxval = 95, group = grpP) / 100.0
+maxNaked  = input.int(5, "Naked POCs to track", minval = 0, maxval = 20, group = grpP)
+
+grpL = "Level groups"
+useHTF    = input.bool(true, "Prior week / month", group = grpL)
+usePD     = input.bool(true, "Prior day (RTH + Globex)", group = grpL)
+useON     = input.bool(true, "Overnight H/L + opens", group = grpL)
+useVP     = input.bool(true, "Volume profile (POC / VA / naked POC)", group = grpL)
+useIB     = input.bool(true, "Initial balance + opening range", group = grpL)
+useSess   = input.bool(true, "Asia / London H/L", group = grpL)
+useVWAP   = input.bool(true, "VWAP + bands", group = grpL)
+vwapMode  = input.string("RTH", "VWAP anchor", options = ["RTH", "Globex"], group = grpL)
+useImp    = input.bool(true, "VXN implied move + ADR targets", group = grpL)
+useRound  = input.bool(true, "Round numbers", group = grpL)
+
+grpD = "Display"
+showTable = input.bool(true, "Show nearest-levels table", group = grpD)
+showZones = input.bool(true, "Shade merged zones", group = grpD)
+plotVWAP  = input.bool(true, "Plot VWAP line", group = grpD)
+
+cHTF   = input.color(#b388ff, "Week / month", group = grpD)
+cPD    = input.color(#42a5f5, "Prior day", group = grpD)
+cON    = input.color(#ffca28, "Overnight / opens", group = grpD)
+cVP    = input.color(#ec407a, "Volume profile", group = grpD)
+cIB    = input.color(#26a69a, "IB / opening range", group = grpD)
+cSess  = input.color(#a1887f, "Asia / London", group = grpD)
+cVWAP  = input.color(#00bcd4, "VWAP", group = grpD)
+cImp   = input.color(#ff7043, "Implied move / ADR", group = grpD)
+cRound = input.color(#9e9e9e, "Round numbers", group = grpD)
+
+// ── Session state ────────────────────────────────────────────────────────────
+inSess(string s) => not na(time(timeframe.period, s, TZ))
+
+bool newDay   = timeframe.change("D")             // CME Globex day: 18:00 ET
+bool inRTH    = inSess(rthSess)
+bool rthStart = inRTH and not inRTH[1]
+bool rthEnd   = not inRTH and inRTH[1]
+
+int    orEndMin = 570 + orMins
+string orSess   = "0930-" + str.tostring(math.floor(orEndMin / 60), "00") + str.tostring(orEndMin % 60, "00")
+bool   inIB     = inSess(ibSess)
+bool   inOR     = inSess(orSess)
+bool   inAsia   = inSess(asiaSess)
+bool   inLond   = inSess(londSess)
+bool   midnight = hour(time, TZ) == 0 and hour(time[1], TZ) != 0
+
+// Globex day
+var int   dayStartBar = 0
+var float dayH = na
+var float dayL = na
+var float glbxOpen = na
+var float midOpen = na
+if newDay
+    dayStartBar := bar_index
+    dayH        := high
+    dayL        := low
+    glbxOpen    := open
+    midOpen     := na
+else
+    dayH := math.max(dayH, high)
+    dayL := math.min(dayL, low)
+if midnight
+    midOpen := open
+
+// Overnight: Globex open → RTH open
+var float onH = na
+var float onL = na
+var bool  onLive = false
+if newDay
+    onH    := high
+    onL    := low
+    onLive := true
+else if onLive and not inRTH
+    onH := math.max(onH, high)
+    onL := math.min(onL, low)
+if rthStart
+    onLive := false
+
+// RTH day, initial balance, opening range
+var bool  rthToday = false
+var float rthO = na
+var float rthH = na
+var float rthL = na
+var float rthC = na
+var float pRthH = na
+var float pRthL = na
+var float pRthC = na
+var float ibH = na
+var float ibL = na
+var bool  ibDone = false
+var float orH = na
+var float orL = na
+if newDay
+    rthToday := false
+if rthStart
+    rthToday := true
+    rthO     := open
+    rthH     := high
+    rthL     := low
+    ibH      := high
+    ibL      := low
+    ibDone   := false
+    orH      := high
+    orL      := low
+else if inRTH
+    rthH := math.max(rthH, high)
+    rthL := math.min(rthL, low)
+    if inIB
+        ibH := math.max(ibH, high)
+        ibL := math.min(ibL, low)
+    if inOR
+        orH := math.max(orH, high)
+        orL := math.min(orL, low)
+if inRTH
+    rthC := close
+if rthToday and inRTH and not inIB
+    ibDone := true
+
+// Asia / London
+asiaStart = inAsia and not inAsia[1]
+londStart = inLond and not inLond[1]
+var float asiaH = na
+var float asiaL = na
+var float londH = na
+var float londL = na
+if newDay
+    asiaH := na
+    asiaL := na
+    londH := na
+    londL := na
+if asiaStart
+    asiaH := high
+    asiaL := low
+else if inAsia
+    asiaH := math.max(asiaH, high)
+    asiaL := math.min(asiaL, low)
+if londStart
+    londH := high
+    londL := low
+else if inLond
+    londH := math.max(londH, high)
+    londL := math.min(londL, low)
+
+// ── RTH volume profile ───────────────────────────────────────────────────────
+var map<int, float> prof = map.new<int, float>()
+var int   rthStartTime = na
+var float pPOC = na
+var float pVAH = na
+var float pVAL = na
+var array<float> nakedP = array.new<float>()
+var array<int>   nakedT = array.new<int>()
+
+profileLevels(map<int, float> pr) =>
+    float poc = na
+    float vah = na
+    float val = na
+    if pr.size() > 0
+        array<int> ks = pr.keys().copy()
+        ks.sort()
+        int n = ks.size()
+        array<float> vs = array.new<float>(n, 0.0)
+        float total = 0.0
+        int   pocIdx    = 0
+        for i = 0 to n - 1
+            float v = pr.get(ks.get(i))
+            vs.set(i, v)
+            total += v
+            if v > vs.get(pocIdx)
+                pocIdx := i
+        float acc = vs.get(pocIdx)
+        int   up  = pocIdx
+        int   dn  = pocIdx
+        while acc < total * vaPct and (up < n - 1 or dn > 0)
+            float vUp = up < n - 1 ? vs.get(up + 1) : -1.0
+            float vDn = dn > 0 ? vs.get(dn - 1) : -1.0
+            if vUp >= vDn
+                up  += 1
+                acc += vUp
+            else
+                dn  -= 1
+                acc += vDn
+        poc := math.round_to_mintick((ks.get(pocIdx) + 0.5) * rowSize)
+        vah := math.round_to_mintick((ks.get(up) + 1) * rowSize)
+        val := math.round_to_mintick(ks.get(dn) * rowSize)
+    [poc, vah, val]
+
+// A naked POC is "filled" once any later bar trades through it.
+if nakedP.size() > 0
+    for i = nakedP.size() - 1 to 0
+        float p = nakedP.get(i)
+        if low <= p and high >= p
+            nakedP.remove(i)
+            nakedT.remove(i)
+
+if rthStart
+    prof.clear()
+    rthStartTime := time
+if inRTH
+    int   lo = int(math.floor(low / rowSize))
+    int   hi = int(math.floor(high / rowSize))
+    float v  = nz(volume) / (hi - lo + 1)
+    for b = lo to hi
+        prof.put(b, nz(prof.get(b)) + v)
+if rthEnd
+    pRthH := rthH
+    pRthL := rthL
+    pRthC := rthC
+    [poc, vah, val] = profileLevels(prof)
+    pPOC := poc
+    pVAH := vah
+    pVAL := val
+    if not na(poc) and maxNaked > 0
+        nakedP.push(poc)
+        nakedT.push(rthStartTime)
+        while nakedP.size() > maxNaked
+            nakedP.shift()
+            nakedT.shift()
+
+// ── Higher-timeframe & volatility data (non-repainting) ──────────────────────
+[pwH, pwL, wOpen] = request.security(syminfo.tickerid, "W", [high[1], low[1], open], lookahead = barmerge.lookahead_on)
+[pmH, pmL]        = request.security(syminfo.tickerid, "M", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[dAtr, pgH, pgL, adr] = request.security(syminfo.tickerid, "D", [ta.atr(14)[1], high[1], low[1], ta.sma(high - low, 14)[1]], lookahead = barmerge.lookahead_on)
+float vxn = request.security("CBOE:VXN", "D", close[1], lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+
+float atrD    = nz(dAtr, ta.atr(14) * 20)
+float impMove = not na(vxn) and not na(pRthC) ? pRthC * vxn / 100.0 / math.sqrt(252) : na
+
+// ── VWAP ─────────────────────────────────────────────────────────────────────
+bool vwAnchor = vwapMode == "RTH" ? rthStart : newDay
+[vw, vwU1, vwL1] = ta.vwap(hlc3, vwAnchor, 1.0)
+[vw2, vwU2, vwL2] = ta.vwap(hlc3, vwAnchor, 2.0)
+bool vwLive = vwapMode == "Globex" or inRTH
+plot(plotVWAP and useVWAP and vwLive ? vw : na,   "VWAP",       cVWAP, 2, plot.style_linebr)
+plot(plotVWAP and useVWAP and vwLive ? vwU1 : na, "VWAP +1σ",   color.new(cVWAP, 60), 1, plot.style_linebr)
+plot(plotVWAP and useVWAP and vwLive ? vwL1 : na, "VWAP -1σ",   color.new(cVWAP, 60), 1, plot.style_linebr)
+plot(plotVWAP and useVWAP and vwLive ? vwU2 : na, "VWAP +2σ",   color.new(cVWAP, 40), 1, plot.style_linebr)
+plot(plotVWAP and useVWAP and vwLive ? vwL2 : na, "VWAP -2σ",   color.new(cVWAP, 40), 1, plot.style_linebr)
+
+// ── Level collection, clustering, drawing ────────────────────────────────────
+type Lvl
+    float  p
+    string n
+    int    w
+    color  c
+
+addLvl(array<Lvl> a, float p, string n, int w, color c) =>
+    if not na(p) and p > 0
+        a.push(Lvl.new(p, n, w, c))
+
+stars(int s) => s >= 7 ? "★★★" : s >= 4 ? "★★" : "★"
+
+var array<line>  drawnL = array.new<line>()
+var array<label> drawnT = array.new<label>()
+var array<box>   drawnB = array.new<box>()
+var table tbl = table.new(position.bottom_right, 3, 8, bgcolor = color.new(color.black, 75), border_width = 1)
+
+if barstate.islast
+    for o in drawnL
+        o.delete()
+    for o in drawnT
+        o.delete()
+    for o in drawnB
+        o.delete()
+    drawnL.clear()
+    drawnT.clear()
+    drawnB.clear()
+
+    array<Lvl> lv = array.new<Lvl>()
+    if useHTF
+        addLvl(lv, pmH,   "pMonth H", 4, cHTF)
+        addLvl(lv, pmL,   "pMonth L", 4, cHTF)
+        addLvl(lv, pwH,   "pWeek H",  3, cHTF)
+        addLvl(lv, pwL,   "pWeek L",  3, cHTF)
+        addLvl(lv, wOpen, "Week Open", 2, cHTF)
+    if usePD
+        addLvl(lv, pRthH, "PDH", 3, cPD)
+        addLvl(lv, pRthL, "PDL", 3, cPD)
+        addLvl(lv, pRthC, "PDC (gap fill)", 2, cPD)
+        if pgH != pRthH
+            addLvl(lv, pgH, "pGlobex H", 1, cPD)
+        if pgL != pRthL
+            addLvl(lv, pgL, "pGlobex L", 1, cPD)
+    if useON
+        addLvl(lv, onH,      "ONH", 3, cON)
+        addLvl(lv, onL,      "ONL", 3, cON)
+        addLvl(lv, glbxOpen, "Globex Open", 1, cON)
+        addLvl(lv, midOpen,  "Midnight Open", 1, cON)
+        if rthToday
+            addLvl(lv, rthO, "RTH Open", 2, cON)
+    if useVP
+        addLvl(lv, pPOC, "pPOC", 3, cVP)
+        addLvl(lv, pVAH, "pVAH", 2, cVP)
+        addLvl(lv, pVAL, "pVAL", 2, cVP)
+        for [i, p] in nakedP
+            if p != pPOC
+                addLvl(lv, p, "nPOC " + str.format_time(nakedT.get(i), "MM/dd", TZ), 3, cVP)
+        if inRTH
+            [dPoc, dVah, dVal] = profileLevels(prof)
+            addLvl(lv, dPoc, "dPOC", 2, cVP)
+    if useIB and rthToday
+        addLvl(lv, ibH, ibDone ? "IBH" : "IBH (forming)", 2, cIB)
+        addLvl(lv, ibL, ibDone ? "IBL" : "IBL (forming)", 2, cIB)
+        if ibDone
+            float ibR = ibH - ibL
+            addLvl(lv, ibH + ibR * 0.5, "IB +50%",  1, cIB)
+            addLvl(lv, ibL - ibR * 0.5, "IB -50%",  1, cIB)
+            addLvl(lv, ibH + ibR,       "IB +100%", 1, cIB)
+            addLvl(lv, ibL - ibR,       "IB -100%", 1, cIB)
+        addLvl(lv, orH, "ORH", 1, cIB)
+        addLvl(lv, orL, "ORL", 1, cIB)
+    if useSess
+        addLvl(lv, asiaH, "Asia H", 1, cSess)
+        addLvl(lv, asiaL, "Asia L", 1, cSess)
+        addLvl(lv, londH, "London H", 2, cSess)
+        addLvl(lv, londL, "London L", 2, cSess)
+    if useVWAP and vwLive
+        addLvl(lv, vw,   "VWAP",    2, cVWAP)
+        addLvl(lv, vwU2, "VWAP +2σ", 1, cVWAP)
+        addLvl(lv, vwL2, "VWAP -2σ", 1, cVWAP)
+    if useImp
+        addLvl(lv, pRthC + impMove, "Implied +1σ", 2, cImp)
+        addLvl(lv, pRthC - impMove, "Implied -1σ", 2, cImp)
+        addLvl(lv, dayL + adr, "ADR High", 1, cImp)
+        addLvl(lv, dayH - adr, "ADR Low",  1, cImp)
+    if useRound
+        int rLo = int(math.floor((close - rangeAtr * atrD) / 100))
+        int rHi = int(math.ceil((close + rangeAtr * atrD) / 100))
+        for k = rLo to rHi
+            int ri = k * 100
+            addLvl(lv, ri, str.tostring(ri), ri % 1000 == 0 ? 3 : ri % 500 == 0 ? 2 : 1, cRound)
+
+    // Sort by price and merge neighbours into clusters.
+    float cDist = clusterPts > 0 ? clusterPts : atrD * 0.04
+    array<float> prices = array.new<float>()
+    for l in lv
+        prices.push(l.p)
+    array<int> order = prices.sort_indices()
+
+    array<float>  cRep   = array.new<float>()
+    array<float>  cMin   = array.new<float>()
+    array<float>  cMax   = array.new<float>()
+    array<int>    cScore = array.new<int>()
+    array<string> cName  = array.new<string>()
+    array<color>  cCol   = array.new<color>()
+    int bestW = 0
+    for idx in order
+        Lvl l = lv.get(idx)
+        int last = cRep.size() - 1
+        if last >= 0 and l.p - cMin.get(last) <= cDist
+            cMax.set(last, l.p)
+            cScore.set(last, cScore.get(last) + l.w)
+            cName.set(last, cName.get(last) + " · " + l.n)
+            if l.w > bestW
+                bestW := l.w
+                cRep.set(last, l.p)
+                cCol.set(last, l.c)
+        else
+            cRep.push(l.p)
+            cMin.push(l.p)
+            cMax.push(l.p)
+            cScore.push(l.w)
+            cName.push(l.n)
+            cCol.push(l.c)
+            bestW := l.w
+
+    int xR = bar_index + rightPad
+    float reach = rangeAtr * atrD
+    for [i, rep] in cRep
+        int s = cScore.get(i)
+        if s >= minScore and math.abs(rep - close) <= reach
+            color c   = cCol.get(i)
+            int   wid = s >= 7 ? 3 : s >= 4 ? 2 : 1
+            string st = s >= 4 ? line.style_solid : line.style_dashed
+            drawnL.push(line.new(dayStartBar, rep, xR, rep, color = color.new(c, s >= 4 ? 0 : 30), width = wid, style = st))
+            drawnT.push(label.new(xR, rep, stars(s) + " " + cName.get(i) + "  " + str.tostring(rep, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = c, size = s >= 4 ? size.normal : size.small))
+            if showZones and cMax.get(i) > cMin.get(i)
+                drawnB.push(box.new(dayStartBar, cMax.get(i), xR, cMin.get(i), border_color = color.new(c, 100), bgcolor = color.new(c, 85)))
+
+    // Nearest qualifying levels above / below price.
+    if showTable
+        tbl.clear(0, 0, 2, 7)
+        tbl.cell(0, 0, "Level", text_color = color.white, text_size = size.small)
+        tbl.cell(1, 0, "Price", text_color = color.white, text_size = size.small)
+        tbl.cell(2, 0, "Pts",   text_color = color.white, text_size = size.small)
+        array<int> above = array.new<int>()
+        array<int> below = array.new<int>()
+        for [i, rep] in cRep
+            if cScore.get(i) >= minScore
+                if rep > close
+                    above.push(i)
+                else
+                    below.unshift(i)
+        int row = 1
+        int nA = math.min(3, above.size())
+        if nA > 0
+            for k = nA - 1 to 0
+                int i = above.get(k)
+                tbl.cell(0, row, stars(cScore.get(i)) + " " + cName.get(i), text_color = cCol.get(i), text_size = size.small, text_halign = text.align_left)
+                tbl.cell(1, row, str.tostring(cRep.get(i), format.mintick), text_color = color.white, text_size = size.small)
+                tbl.cell(2, row, "+" + str.tostring(cRep.get(i) - close, "#.##"), text_color = color.new(#26a69a, 0), text_size = size.small)
+                row += 1
+        tbl.cell(0, row, "▶ Price", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+        tbl.cell(1, row, str.tostring(close, format.mintick), text_color = color.white, text_size = size.small)
+        tbl.cell(2, row, "", text_size = size.small)
+        row += 1
+        int nB = math.min(3, below.size())
+        if nB > 0
+            for k = 0 to nB - 1
+                int i = below.get(k)
+                tbl.cell(0, row, stars(cScore.get(i)) + " " + cName.get(i), text_color = cCol.get(i), text_size = size.small, text_halign = text.align_left)
+                tbl.cell(1, row, str.tostring(cRep.get(i), format.mintick), text_color = color.white, text_size = size.small)
+                tbl.cell(2, row, str.tostring(cRep.get(i) - close, "#.##"), text_color = color.new(#ef5350, 0), text_size = size.small)
+                row += 1
