@@ -66,3 +66,19 @@ Gives buy and sell signals when a **rejection block** lines up with another setu
 - A zone is removed once price closes through its far side, or after it expires.
 - By default each zone can trigger only one signal.
 - Signals are final at bar close. Use the alerts, which fire once per bar close.
+
+## `rb_ob_entries.pine`: Rejection Block × Order Block Entries (Pine Script v6)
+
+Short setup (long is the mirror image):
+1. A strong bearish **displacement** candle (body ≥ 1.2× ATR) leaves an upper wick.
+2. The wick, from the candle's **open to its high**, is the **rejection block**.
+3. The wick must cover the **order block directly to its left**: the most recent bullish candle within 3 bars, with ≥ 70% of its body inside the wick.
+4. **Entry:** limit at the rejection block **midpoint** when price retraces into it. The entry candle is painted bright yellow.
+5. **Stop:** just above the rejection block high (2-tick buffer).
+6. **Target:** the **next liquidity**, meaning the most recent swing low that formed after the displacement. The setup is skipped if reward:risk is below 2.
+
+Drawn on the chart: the rejection block box with a dashed midpoint line, red stop and green target boxes once filled, an entry label, and a ✔/✖ result label when the trade closes. A table shows win/loss and net R.
+
+Alerts:
+- **Setup armed:** a new rejection block, with the limit and stop prices.
+- **Entry filled.**

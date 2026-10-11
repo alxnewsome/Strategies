@@ -1,0 +1,234 @@
+//@version=6
+indicator("Rejection Block × Order Block Entries", shorttitle = "RB×OB", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The setup (short shown, long is the mirror image):
+//   1. A strong bearish DISPLACEMENT candle leaves an upper wick.
+//   2. That wick, from the candle's OPEN up to its HIGH, is the REJECTION BLOCK.
+//   3. The wick has to cover the ORDER BLOCK directly to its left: the most
+//      recent bullish candle within a few bars, whose body sits inside the wick.
+//   4. Entry is a limit at the MIDPOINT of the rejection block when price
+//      retraces into it.
+//   5. Stop goes just above the rejection block high.
+//   6. Target is the NEXT LIQUIDITY: the most recent swing low that formed
+//      after the displacement (the one price is retracing away from).
+// The candle that fills the entry is painted bright yellow.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpS = "Setup"
+dispAtr     = input.float(1.2, "Displacement body ≥ (× ATR)", minval = 0.1, step = 0.1, group = grpS, tooltip = "How big the candle that leaves the rejection wick must be.")
+minWickAtr  = input.float(0.25, "Rejection wick ≥ (× ATR)", minval = 0.0, step = 0.05, group = grpS)
+obLook      = input.int(3, "Order block search (bars to the left)", minval = 1, maxval = 10, group = grpS)
+obInsidePct = input.float(70, "Order block body inside the wick (%)", minval = 0, maxval = 100, step = 5, group = grpS, tooltip = "How much of the order block candle's body must sit inside the rejection wick. 100 = fully covered.")
+
+grpT = "Trade"
+stopTicks = input.int(2, "Stop buffer beyond RB (ticks)", minval = 0, group = grpT)
+pivLen    = input.int(3, "Liquidity swing length", minval = 1, maxval = 20, group = grpT, tooltip = "Swing highs/lows used as targets need this many bars on each side.")
+minRR     = input.float(2.0, "Minimum reward:risk (0 = off)", minval = 0.0, step = 0.5, group = grpT)
+expiry    = input.int(150, "Cancel unfilled setup after (bars)", minval = 5, group = grpT)
+
+grpD = "Display"
+sigCol    = input.color(#FFFF00, "Entry candle", group = grpD)
+bullZone  = input.color(#26a69a, "Bullish RB", group = grpD)
+bearZone  = input.color(#00bcd4, "Bearish RB", group = grpD)
+riskCol   = input.color(#f23645, "Stop area", group = grpD)
+rewardCol = input.color(#089981, "Target area", group = grpD)
+showStats = input.bool(true, "Show results table", group = grpD)
+
+// ── Core series ──────────────────────────────────────────────────────────────
+float atr   = ta.atr(14)
+float body  = math.abs(close - open)
+float upW   = high - math.max(open, close)
+float dnW   = math.min(open, close) - low
+float buf   = stopTicks * syminfo.mintick
+
+fmt(float p) => str.tostring(p, format.mintick)
+
+// Liquidity swings (confirmed pivots)
+var array<float> swHiP = array.new<float>()
+var array<int>   swHiB = array.new<int>()
+var array<float> swLoP = array.new<float>()
+var array<int>   swLoB = array.new<int>()
+float ph = ta.pivothigh(high, pivLen, pivLen)
+float pl = ta.pivotlow(low, pivLen, pivLen)
+if not na(ph)
+    swHiP.push(ph)
+    swHiB.push(bar_index - pivLen)
+    if swHiP.size() > 50
+        swHiP.shift()
+        swHiB.shift()
+if not na(pl)
+    swLoP.push(pl)
+    swLoB.push(bar_index - pivLen)
+    if swLoP.size() > 50
+        swLoP.shift()
+        swLoB.shift()
+
+// Does the wick [zBot, zTop] cover the order block candle to the left?
+obCovered(bool bearSetup, float zTop, float zBot) =>
+    bool ok = false
+    for k = 1 to obLook
+        bool opposite = bearSetup ? close[k] > open[k] : close[k] < open[k]
+        if opposite
+            float bTop   = math.max(open[k], close[k])
+            float bBot   = math.min(open[k], close[k])
+            float bodyH  = bTop - bBot
+            float inside = math.max(0.0, math.min(bTop, zTop) - math.max(bBot, zBot))
+            ok := bodyH > 0 ? inside / bodyH * 100 >= obInsidePct : (bTop <= zTop and bBot >= zBot)
+            break
+    ok
+
+bool bearCover = obCovered(true,  high, math.max(open, close))
+bool bullCover = obCovered(false, math.min(open, close), low)
+bool bearRB = close < open and body >= dispAtr * atr and upW >= minWickAtr * atr and bearCover
+bool bullRB = close > open and body >= dispAtr * atr and dnW >= minWickAtr * atr and bullCover
+
+// ── Setups ───────────────────────────────────────────────────────────────────
+type Setup
+    bool  bull
+    float top
+    float bot
+    float mid
+    float stop
+    int   left
+    int   state = 0          // 0 = waiting for entry, 1 = in trade
+    float entry
+    float target
+    box   zone
+    line  midLn
+    box   riskBx
+    box   rewBx
+
+var array<Setup> setups = array.new<Setup>()
+var array<float> stats  = array.from(0.0, 0.0, 0.0)   // wins, losses, net R
+
+// Next liquidity: most recent swing beyond the entry that formed after the RB
+// candle; if none, the extreme since the RB candle.
+findTarget(Setup s) =>
+    float tgt = na
+    array<float> ps = s.bull ? swHiP : swLoP
+    array<int>   bs = s.bull ? swHiB : swLoB
+    if ps.size() > 0
+        for i = ps.size() - 1 to 0
+            if bs.get(i) <= s.left
+                break
+            float p = ps.get(i)
+            if s.bull ? p > s.mid : p < s.mid
+                tgt := p
+                break
+    if na(tgt)
+        for k = 0 to bar_index - s.left
+            tgt := na(tgt) ? (s.bull ? high[k] : low[k]) : s.bull ? math.max(tgt, high[k]) : math.min(tgt, low[k])
+    tgt
+
+closeTrade(Setup s, bool win) =>
+    float r = win ? math.abs(s.target - s.entry) / math.abs(s.entry - s.stop) : -1.0
+    stats.set(win ? 0 : 1, stats.get(win ? 0 : 1) + 1)
+    stats.set(2, stats.get(2) + r)
+    s.riskBx.set_right(bar_index)
+    s.rewBx.set_right(bar_index)
+    s.zone.set_right(bar_index)
+    s.midLn.set_x2(bar_index)
+    float y = win ? s.target : s.stop
+    label.new(bar_index, y, win ? "✔ +" + str.tostring(r, "#.0") + "R" : "✖ -1R", style = (s.bull == win) ? label.style_label_down : label.style_label_up, color = win ? rewardCol : riskCol, textcolor = color.white, size = size.small)
+
+bool fillBull = false
+bool fillBear = false
+
+if setups.size() > 0
+    for i = setups.size() - 1 to 0
+        Setup s = setups.get(i)
+        if s.state == 0
+            if bar_index - s.left > expiry
+                s.zone.set_bgcolor(color.new(color.gray, 92))
+                s.zone.set_border_color(color.new(color.gray, 70))
+                s.zone.set_right(bar_index)
+                s.midLn.set_x2(bar_index)
+                setups.remove(i)
+            else
+                s.zone.set_right(bar_index + 1)
+                s.midLn.set_x2(bar_index + 1)
+                bool touched = s.bull ? low <= s.mid : high >= s.mid
+                if touched
+                    float tgt  = findTarget(s)
+                    float risk = math.abs(s.mid - s.stop)
+                    float rr   = na(tgt) or risk <= 0 ? 0.0 : math.abs(tgt - s.mid) / risk
+                    if na(tgt) or rr < minRR
+                        // Not enough room to the next liquidity: skip it.
+                        s.zone.set_bgcolor(color.new(color.gray, 92))
+                        s.zone.set_border_color(color.new(color.gray, 70))
+                        s.zone.set_text("RB · " + str.tostring(rr, "#.0") + "R skipped")
+                        s.zone.set_right(bar_index)
+                        s.midLn.set_x2(bar_index)
+                        setups.remove(i)
+                    else
+                        s.state  := 1
+                        s.entry  := s.mid
+                        s.target := tgt
+                        s.riskBx := box.new(bar_index, math.max(s.entry, s.stop), bar_index + 1, math.min(s.entry, s.stop), border_color = color.new(riskCol, 60), bgcolor = color.new(riskCol, 80))
+                        s.rewBx  := box.new(bar_index, math.max(s.entry, tgt), bar_index + 1, math.min(s.entry, tgt), border_color = color.new(rewardCol, 60), bgcolor = color.new(rewardCol, 80))
+                        string txt = (s.bull ? "LONG" : "SHORT") + "  " + str.tostring(rr, "#.0") + "R\nEntry " + fmt(s.entry) + "\nStop " + fmt(s.stop) + "\nTarget " + fmt(tgt)
+                        label.new(bar_index, s.bull ? low : high, txt, style = s.bull ? label.style_label_up : label.style_label_down, yloc = s.bull ? yloc.belowbar : yloc.abovebar, color = color.new(color.black, 20), textcolor = sigCol, size = size.small)
+                        if s.bull
+                            fillBull := true
+                        else
+                            fillBear := true
+                        // Stopped out on the same bar it filled (conservative).
+                        if s.bull ? low <= s.stop : high >= s.stop
+                            closeTrade(s, false)
+                            setups.remove(i)
+        else
+            s.riskBx.set_right(bar_index + 1)
+            s.rewBx.set_right(bar_index + 1)
+            s.zone.set_right(bar_index + 1)
+            s.midLn.set_x2(bar_index + 1)
+            bool stopHit = s.bull ? low <= s.stop : high >= s.stop
+            bool tgtHit  = s.bull ? high >= s.target : low <= s.target
+            if stopHit or tgtHit
+                closeTrade(s, not stopHit)
+                setups.remove(i)
+
+// Register new rejection blocks formed on this bar.
+newSetup(bool bull, float top, float bot) =>
+    color c   = bull ? bullZone : bearZone
+    float mid = (top + bot) / 2
+    float stp = bull ? bot - buf : top + buf
+    Setup s = Setup.new(bull, top, bot, mid, stp, bar_index)
+    s.zone  := box.new(bar_index, top, bar_index + 1, bot, border_color = c, bgcolor = color.new(c, 80), text = "RB", text_size = size.tiny, text_color = c, text_halign = text.align_right, text_valign = bull ? text.align_bottom : text.align_top)
+    s.midLn := line.new(bar_index, mid, bar_index + 1, mid, color = c, style = line.style_dashed)
+    setups.push(s)
+    s
+
+if bearRB
+    Setup s = newSetup(false, high, math.max(open, close))
+    alert("RB×OB SHORT armed on " + syminfo.ticker + ": sell limit " + fmt(s.mid) + ", stop " + fmt(s.stop), alert.freq_once_per_bar_close)
+if bullRB
+    Setup s = newSetup(true, math.min(open, close), low)
+    alert("RB×OB LONG armed on " + syminfo.ticker + ": buy limit " + fmt(s.mid) + ", stop " + fmt(s.stop), alert.freq_once_per_bar_close)
+if fillBull
+    alert("RB×OB LONG filled on " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar)
+if fillBear
+    alert("RB×OB SHORT filled on " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar)
+
+barcolor(fillBull or fillBear ? sigCol : na, title = "Entry candle")
+
+alertcondition(bullRB,   "Long setup armed",  "Bullish rejection block over an order block on {{ticker}}")
+alertcondition(bearRB,   "Short setup armed", "Bearish rejection block over an order block on {{ticker}}")
+alertcondition(fillBull, "Long entry filled",  "RB midpoint long filled on {{ticker}} @ {{close}}")
+alertcondition(fillBear, "Short entry filled", "RB midpoint short filled on {{ticker}} @ {{close}}")
+
+// ── Results ──────────────────────────────────────────────────────────────────
+var table tbl = table.new(position.bottom_right, 2, 4, bgcolor = color.new(color.black, 75), border_width = 1)
+if showStats and barstate.islast
+    float w = stats.get(0)
+    float l = stats.get(1)
+    float n = w + l
+    tbl.cell(0, 0, "RB×OB trades", text_color = color.white, text_size = size.small)
+    tbl.cell(1, 0, str.tostring(n, "#"), text_color = color.white, text_size = size.small)
+    tbl.cell(0, 1, "Win / Loss", text_color = color.white, text_size = size.small)
+    tbl.cell(1, 1, str.tostring(w, "#") + " / " + str.tostring(l, "#"), text_color = color.white, text_size = size.small)
+    tbl.cell(0, 2, "Win rate", text_color = color.white, text_size = size.small)
+    tbl.cell(1, 2, n > 0 ? str.tostring(100 * w / n, "#.0") + "%" : "–", text_color = color.white, text_size = size.small)
+    tbl.cell(0, 3, "Net R", text_color = color.white, text_size = size.small)
+    tbl.cell(1, 3, str.tostring(stats.get(2), "#.0") + "R", text_color = stats.get(2) >= 0 ? rewardCol : riskCol, text_size = size.small)
