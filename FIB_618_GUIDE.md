@@ -27,6 +27,9 @@ Why 0.618 works as a day-trade entry:
 While the leg is still pushing up (before any pullback to 0.382), the 0 level keeps moving up with each new high, so the fib always measures the full move.
 
 ## What you see on the chart
+- **Entries:** a **green ★ under the candle** where the long fills, and a **red ★ above the candle** where the short fills. The candle is also painted yellow.
+- **Bracket on every trade:** a **red box** from entry to the stop and a **green box** from entry to target 2, with a dashed line at target 1. A label lists entry, TP2, TP1 and SL with the R multiple and stop size in points. The bracket comes from the fib, so its size changes with every setup. When the trade is done it's marked **✔ +$** or **✖ −$**.
+- **Market:** built and tested for **NQ / MNQ / ES / MES** futures. The results table shows the symbol and warns if you're on something else.
 - **The range being measured stands out.** The **0** level (the leg's extreme, labelled *range high* for longs) is green. The **1** level (where the leg started, your stop side) is red. Both lines are thicker, and the range between them is lightly shaded. The HTF fibs use the same green/red for their 0 and 1. All of these colours can be changed in the settings.
 - **One fib at a time.** Only the current setup's fib is drawn. It's deleted when the setup is broken (close beyond 1.0), expires, is missed (price makes a new high or low after pulling back), or the trade finishes. Turn on *Keep fibs of completed trades* to keep traded ones for review.
 - **Higher-timeframe fibs** (15m in purple, 1h in blue by default). Each shows the **current** break-and-retrace leg on that timeframe, with its 0 / 0.5 / 0.618 / 0.786 / 1 levels labelled, e.g. `15m ▲ 0.618`. An HTF fib disappears when it's disrespected or completed, so what's on the chart is always live. When a 5m 0.618 lines up with a 15m or 1h 0.618, that's a stronger entry.

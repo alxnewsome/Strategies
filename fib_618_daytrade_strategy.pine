@@ -213,7 +213,52 @@ if rthStart
     tradesToday := 0
     lossesToday := 0
 bool flat = strategy.position_size == 0
-if flat and strategy.position_size[1] != 0
+
+// ── Fills & bracket ──────────────────────────────────────────────────────────
+// A new fill is detected from the trade count, so a trade that fills and exits
+// on the same candle is still caught.
+var box   brRisk = na
+var box   brRew  = na
+var line  brTp1  = na
+var label brInfo = na
+var bool  brLive = false
+var float brEntry = na
+var int   brDir  = 0
+
+int  totTrades = strategy.opentrades + strategy.closedtrades
+bool newFill   = totTrades > nz(totTrades[1])
+if newFill
+    tradesToday += 1
+    netAtEntry  := nz(strategy.netprofit[1])
+    brEntry := strategy.opentrades > 0 ? strategy.opentrades.entry_price(0) : strategy.closedtrades.entry_price(strategy.closedtrades - 1)
+    brDir   := dir
+    float sl  = A - dir * stopTicks * syminfo.mintick
+    float tp1 = lvl(0.0)
+    float tp2 = qty2 > 0 ? lvl(-0.272) : tp1
+    float rr1 = math.abs(tp1 - brEntry) / math.abs(brEntry - sl)
+    float rr2 = math.abs(tp2 - brEntry) / math.abs(brEntry - sl)
+    brRisk := box.new(bar_index, math.max(brEntry, sl), bar_index + 1, math.min(brEntry, sl), border_color = color.new(#f23645, 30), bgcolor = color.new(#f23645, 78))
+    brRew  := box.new(bar_index, math.max(brEntry, tp2), bar_index + 1, math.min(brEntry, tp2), border_color = color.new(#089981, 30), bgcolor = color.new(#089981, 78))
+    brTp1  := line.new(bar_index, tp1, bar_index + 1, tp1, color = #00e676, style = line.style_dashed, width = 1)
+    string info = (dir == 1 ? "LONG" : "SHORT") + " @ " + str.tostring(brEntry, format.mintick) + (confTxt != "" ? "  ★ " + confTxt : "") + "\nTP2 " + str.tostring(tp2, format.mintick) + "  (" + str.tostring(rr2, "#.0") + "R)" + "\nTP1 " + str.tostring(tp1, format.mintick) + "  (" + str.tostring(rr1, "#.0") + "R)" + "\nSL  " + str.tostring(sl, format.mintick) + "  (" + str.tostring(math.abs(brEntry - sl), "#.##") + " pts)"
+    brInfo := label.new(bar_index, dir == 1 ? math.max(brEntry, tp2) : math.min(brEntry, tp2), info, style = dir == 1 ? label.style_label_down : label.style_label_up, color = color.new(color.black, 20), textcolor = color.white, size = size.small, textalign = text.align_left)
+    brLive := true
+
+if brLive and strategy.opentrades > 0
+    brRisk.set_right(bar_index + 1)
+    brRew.set_right(bar_index + 1)
+    brTp1.set_x2(bar_index + 1)
+
+// Trade finished (all legs out): freeze the bracket, mark the result, clean up.
+if brLive and strategy.opentrades == 0
+    brRisk.set_right(bar_index)
+    brRew.set_right(bar_index)
+    brTp1.set_x2(bar_index)
+    float pnl = strategy.netprofit - netAtEntry
+    label.new(bar_index, brDir == 1 ? high : low, (pnl >= 0 ? "✔ +$" : "✖ -$") + str.tostring(math.abs(pnl), "#,###"), style = brDir == 1 ? label.style_label_down : label.style_label_up, color = pnl >= 0 ? #089981 : #f23645, textcolor = color.white, size = size.tiny)
+    brLive := false
+    if pnl < 0
+        lossesToday += 1
     strategy.cancel_all()
     active := false
     if keepDone
@@ -223,8 +268,6 @@ if flat and strategy.position_size[1] != 0
         fibB.clear()
     else
         clearFib()
-    if strategy.netprofit < netAtEntry
-        lossesToday += 1
 bool canTrade = inWin and flat and tradesToday < maxTrades and lossesToday < maxLosses
 
 // Key levels near the 0.618
@@ -306,12 +349,6 @@ else if active and not flat
         string e2 = dir == 1 ? "L2" : "S2"
         strategy.exit(e2 + " x", e2, stop = strategy.position_avg_price, limit = lvl(-0.272))
 
-// New position opened this bar → count it.
-bool opened = flat[1] and not flat
-if opened
-    tradesToday += 1
-    netAtEntry  := strategy.netprofit
-    label.new(bar_index, dir == 1 ? low : high, (dir == 1 ? "LONG 0.618" : "SHORT 0.618") + (confTxt != "" ? "\n★ " + confTxt : ""), yloc = dir == 1 ? yloc.belowbar : yloc.abovebar, style = dir == 1 ? label.style_label_up : label.style_label_down, color = color.new(color.black, 15), textcolor = goldCol, size = size.small)
 
 if flatNow and (not flat or active)
     strategy.close_all("EOD flat")
@@ -415,12 +452,14 @@ if barstate.islast
         drawHtf(htf2, h2d, h2A, h2B, col2)
 
 // ── Visuals ──────────────────────────────────────────────────────────────────
-barcolor(opened ? sigCol : na, title = "Entry candle")
+barcolor(newFill ? sigCol : na, title = "Entry candle")
+plotchar(newFill and brDir == 1,  "Long entry ★",  "★", location.belowbar, color.new(#00e676, 0), size = size.normal)
+plotchar(newFill and brDir == -1, "Short entry ★", "★", location.abovebar, color.new(#ff1744, 0), size = size.normal)
 plot(vw, "VWAP", color.new(#00bcd4, 20), 2)
 plot(useHtf ? hE : na, "HTF EMA", color.new(#ff9800, 40), 1, plot.style_stepline)
 plot(not flat ? stopPx : na, "Stop", color.new(#f23645, 0), 2, plot.style_linebr)
 
-var table perf = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 75), border_width = 1)
+var table perf = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 75), border_width = 1)
 if barstate.islast
     int   n  = strategy.closedtrades
     int   w  = strategy.wintrades
@@ -439,7 +478,10 @@ if barstate.islast
     perf.cell(1, 4, na(pf) ? "–" : str.tostring(pf, "#.00"), text_color = na(pf) ? color.gray : pf >= 1 ? color.lime : color.red, text_size = size.small)
     perf.cell(0, 5, "Net P&L ($)", text_color = color.white, text_size = size.small)
     perf.cell(1, 5, str.tostring(strategy.netprofit, "#,###"), text_color = strategy.netprofit >= 0 ? color.lime : color.red, text_size = size.small)
+    bool idx = syminfo.root == "NQ" or syminfo.root == "MNQ" or syminfo.root == "ES" or syminfo.root == "MES"
+    perf.cell(0, 6, "Market", text_color = color.white, text_size = size.small)
+    perf.cell(1, 6, syminfo.ticker + (idx ? "" : " (built for NQ/ES)"), text_color = idx ? color.white : color.orange, text_size = size.small)
 
 alertcondition(takeUp, "Long setup", "Bullish break on {{ticker}}: 0.618 buy limit armed")
 alertcondition(takeDn, "Short setup", "Bearish break on {{ticker}}: 0.618 sell limit armed")
-alertcondition(opened, "0.618 entry filled", "0.618 entry filled on {{ticker}} @ {{close}}")
+alertcondition(newFill, "0.618 entry filled", "0.618 entry filled on {{ticker}} @ {{close}}")
