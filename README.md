@@ -99,3 +99,16 @@ A backtestable strategy built for a high win rate. Run it in TradingView's **Str
    - Flat by 15:55.
 
 Each leg (L1/L2) shows as its own trade in the Strategy Tester's list of trades.
+
+## `first_candle_930_strategy.pine`: 9:30 First 5-Min Candle (Pine Script v6 **strategy**)
+
+- **Direction:** after the 09:30–09:35 ET five-minute candle closes, go **long if it's green** and **short if it's red**. A doji means no trade. Entry is at the next bar's open.
+- **Stop:** the far end of the candle's wick (the low for longs, the high for shorts), but at least **15 points** from entry.
+- **Target:** the **next level of liquidity** in the trade direction. It's the nearest of: prior-day RTH high/low, overnight high/low, prior-week high/low, and swing highs/lows price hasn't taken out yet.
+  - The level must be at least 1R away; otherwise the next level out is used.
+  - With no level available, the target falls back to 2R.
+- **Trade limits:** one trade per day, flat by 15:55 ET.
+- **Bracket:** every trade is sent as a stop + target bracket, where one fill cancels the other. It's drawn on the chart as a red stop box and a green target box with a label showing stop, target and R:R.
+- **Results table** (top-right): trades, wins/losses, **win rate**, profit factor, average win/loss and net P&L. The Strategy Tester tab shows the same numbers in full.
+- **Chart:** works on 1–5 minute charts. The 9:30 candle is painted yellow.
+- **Costs:** $2.50/contract/side commission and 1 tick of slippage are included.
