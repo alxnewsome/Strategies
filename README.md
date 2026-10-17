@@ -140,3 +140,12 @@ Marks when price **sweeps the day's opening price**: it trades through the open 
 - **Multi-timeframe:** a 15m EMA bias filter. The leg can be measured on a higher timeframe (e.g. 5m) while entering on the 1m chart.
 - **Limits:** unfilled setups are cancelled after 60 bars, on a close beyond 1.0, or outside the session. Flat by 15:55 ET.
 - **On the chart:** fib lines with a shaded golden pocket, the entry candle painted yellow, stop/target lines, and a win-rate table.
+
+## `fib_618_daytrade_strategy.pine`: 0.618 Day Trade, Break & Retrace (Pine Script v6 **strategy**)
+
+- **Setup:** after a candle closes through the last swing high or low, a limit order goes at the **0.618** retracement of the move that broke it.
+- **Stop:** beyond 1.0.
+- **Exits:** half at the 0 level, the runner at the −0.272 extension with its stop moved to breakeven.
+- **Filters:** VWAP, 15m trend, minimum leg size, trading windows, and daily trade/loss limits. Optionally requires a key level (VWAP, PDH/PDL/PDC, overnight high/low, open) near the 0.618.
+
+Full usage guide, including when **not** to use it: [`FIB_618_GUIDE.md`](FIB_618_GUIDE.md).

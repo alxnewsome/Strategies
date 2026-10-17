@@ -1,0 +1,313 @@
+//@version=6
+strategy("0.618 Day Trade — Break & Retrace", shorttitle = "Fib 618 DT", overlay = true, pyramiding = 2, initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.cash_per_contract, commission_value = 2.5, slippage = 1, max_lines_count = 500, max_labels_count = 500, max_bars_back = 1000)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 0.618 BREAK & RETRACE
+//  1. Structure break: price CLOSES above the last swing high (longs) or below
+//     the last swing low (shorts). That proves buyers (sellers) are in control.
+//  2. Impulse leg: from the low before the break (1.0) to the high after it (0).
+//  3. Entry: limit order at the 0.618 retracement of that leg.
+//  4. Stop: just beyond 1.0. If price gives back the whole leg, the idea is wrong.
+//  5. Exits: half at the 0 level (retest of the high), the runner at the
+//     -0.272 extension with its stop moved to breakeven.
+//  Filters: with VWAP and the 15m trend, minimum leg size, trading windows,
+//  daily trade/loss limits. Optional: require a key level near the 0.618.
+// See FIB_618_GUIDE.md for how to use it and when NOT to.
+// ─────────────────────────────────────────────────────────────────────────────
+
+string TZ = "America/New_York"
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpS = "Structure"
+swL       = input.int(5, "Swing left bars", minval = 1, group = grpS)
+swR       = input.int(2, "Swing right bars", minval = 1, group = grpS, tooltip = "Bars after a swing point before it's confirmed. Lower = faster.")
+minLegAtr = input.float(1.5, "Min impulse leg (× ATR)", minval = 0.0, step = 0.25, group = grpS)
+maxLook   = input.int(100, "Max bars back for the leg start", minval = 10, maxval = 500, group = grpS)
+
+grpE = "Entry"
+entryMode = input.string("Limit at 0.618", "Entry type", options = ["Limit at 0.618", "Rejection candle at 0.618"], group = grpE, tooltip = "Limit: resting order at the level. Rejection: enter on the close of a candle that wicks through 0.618 and closes back in the trend direction.")
+expiry    = input.int(40, "Cancel unfilled setup after (bars)", minval = 5, group = grpE)
+qty1      = input.int(1, "Contracts to target 1 (0 level)", minval = 1, group = grpE)
+qty2      = input.int(1, "Contracts to target 2 (-0.272)", minval = 0, group = grpE)
+
+grpX = "Risk"
+stopTicks = input.int(4, "Stop buffer beyond 1.0 (ticks)", minval = 0, group = grpX)
+moveBE    = input.bool(true, "Runner stop to breakeven after target 1", group = grpX)
+maxTrades = input.int(3, "Max trades per day", minval = 1, group = grpX)
+maxLosses = input.int(2, "Stop after N losing trades per day", minval = 1, group = grpX)
+
+grpF = "Filters"
+useVwap    = input.bool(true, "Longs above VWAP / shorts below", group = grpF)
+useHtf     = input.bool(true, "Higher-timeframe trend filter", group = grpF)
+htfTf      = input.timeframe("15", "HTF timeframe", group = grpF)
+htfLen     = input.int(21, "HTF EMA length", minval = 1, group = grpF)
+needConf   = input.bool(false, "Require a key level near the 0.618", group = grpF, tooltip = "VWAP, prior-day high/low/close, overnight/pre-market high/low or the open within the tolerance below.")
+confTolAtr = input.float(0.25, "Confluence tolerance (× ATR)", minval = 0.0, step = 0.05, group = grpF)
+win1       = input.session("0945-1130", "Window 1 (New York)", group = grpF)
+win2       = input.session("1330-1545", "Window 2 (New York)", group = grpF)
+flatSess   = input.session("1555-1600", "Flatten all (New York)", group = grpF)
+allowLong  = input.bool(true, "Take longs", group = grpF)
+allowShort = input.bool(true, "Take shorts", group = grpF)
+
+grpD = "Display"
+goldCol = input.color(#ffd600, "0.618 level", group = grpD)
+fibCol  = input.color(#9e9e9e, "Other fib levels", group = grpD)
+sigCol  = input.color(#FFFF00, "Entry candle", group = grpD)
+
+// ── Sessions & reference levels ──────────────────────────────────────────────
+inSess(string s) => not na(time(timeframe.period, s, TZ))
+bool inRTH    = inSess("0930-1600")
+bool rthStart = inRTH and not inRTH[1]
+bool rthEnd   = not inRTH and inRTH[1]
+bool inWin    = inSess(win1) or inSess(win2)
+bool flatNow  = inSess(flatSess)
+
+float atr = ta.atr(14)
+float vw  = ta.vwap(hlc3, rthStart)
+
+var float dO = na
+var float dH = na
+var float dL = na
+var float pdH = na
+var float pdL = na
+var float pdC = na
+var float onH = na
+var float onL = na
+if session.isfirstbar
+    onH := high
+    onL := low
+else if not inRTH and not rthEnd
+    onH := math.max(onH, high)
+    onL := math.min(onL, low)
+if rthStart
+    dO := open
+    dH := high
+    dL := low
+else if inRTH
+    dH := math.max(dH, high)
+    dL := math.min(dL, low)
+if rthEnd
+    pdH := dH
+    pdL := dL
+    pdC := close[1]
+
+[hE, hE1] = request.security(syminfo.tickerid, htfTf, [ta.ema(close, htfLen)[1], ta.ema(close, htfLen)[2]], lookahead = barmerge.lookahead_on)
+bool upTrend = (not useHtf or (hE > hE1 and close > hE)) and (not useVwap or close > vw)
+bool dnTrend = (not useHtf or (hE < hE1 and close < hE)) and (not useVwap or close < vw)
+
+// ── Swings & structure breaks ────────────────────────────────────────────────
+float ph = ta.pivothigh(high, swL, swR)
+float pl = ta.pivotlow(low, swL, swR)
+var float lastPH = na
+var int   lastPHbar = na
+var bool  phBroken = true
+var float lastPL = na
+var int   lastPLbar = na
+var bool  plBroken = true
+if not na(ph)
+    lastPH    := ph
+    lastPHbar := bar_index - swR
+    phBroken  := false
+if not na(pl)
+    lastPL    := pl
+    lastPLbar := bar_index - swR
+    plBroken  := false
+
+bool bosUp = not phBroken and close > lastPH
+bool bosDn = not plBroken and close < lastPL
+if bosUp
+    phBroken := true
+if bosDn
+    plBroken := true
+
+// Leg start = extreme between the broken swing and now.
+legStart(bool up, int fromBar) =>
+    int n = math.min(bar_index - fromBar, maxLook)
+    float x = up ? low : high
+    for k = 1 to math.max(n, 1)
+        x := up ? math.min(x, low[k]) : math.max(x, high[k])
+    x
+
+float upA = bosUp ? legStart(true, lastPHbar) : na
+float dnA = bosDn ? legStart(false, lastPLbar) : na
+
+// ── Setup state ──────────────────────────────────────────────────────────────
+var int   dir = 0
+var float A = na          // 1.0
+var float B = na          // 0
+var bool  active = false
+var bool  started = false // price has pulled back to 0.382
+var int   setupBar = na
+var string confTxt = ""
+
+lvl(float r) => B - r * (B - A)
+
+var int   tradesToday = 0
+var int   lossesToday = 0
+var float netAtEntry  = 0.0
+if rthStart
+    tradesToday := 0
+    lossesToday := 0
+bool flat = strategy.position_size == 0
+if flat and strategy.position_size[1] != 0
+    strategy.cancel_all()
+    active := false
+    if strategy.netprofit < netAtEntry
+        lossesToday += 1
+bool canTrade = inWin and flat and tradesToday < maxTrades and lossesToday < maxLosses
+
+// Key levels near the 0.618
+confluence(float p) =>
+    float tol = confTolAtr * atr
+    array<string> hits = array.new<string>()
+    if math.abs(p - vw) <= tol
+        hits.push("VWAP")
+    if math.abs(p - pdH) <= tol
+        hits.push("PDH")
+    if math.abs(p - pdL) <= tol
+        hits.push("PDL")
+    if math.abs(p - pdC) <= tol
+        hits.push("PDC")
+    if math.abs(p - onH) <= tol
+        hits.push("ONH")
+    if math.abs(p - onL) <= tol
+        hits.push("ONL")
+    if math.abs(p - dO) <= tol
+        hits.push("Open")
+    hits.join(" + ")
+
+// ── Fib drawing ──────────────────────────────────────────────────────────────
+var array<float> fibR = array.from(-0.272, 0.0, 0.382, 0.5, 0.618, 0.786, 1.0)
+var array<line>  fibL = array.new<line>()
+var array<label> fibT = array.new<label>()
+
+drawFib() =>
+    fibL.clear()
+    fibT.clear()
+    for r in fibR
+        float p  = lvl(r)
+        bool  g  = r == 0.618
+        color c  = g ? goldCol : fibCol
+        string t = (g ? "0.618 ENTRY" : str.tostring(r)) + "  " + str.tostring(p, format.mintick)
+        fibL.push(line.new(setupBar, p, bar_index + 8, p, color = g ? c : color.new(c, 40), width = g ? 3 : 1, style = (r == 0.382 or r == 0.5 or r == 0.786) ? line.style_dotted : line.style_solid))
+        fibT.push(label.new(bar_index + 8, p, t, style = label.style_label_left, color = color.new(color.black, 100), textcolor = g ? c : color.new(c, 30), size = g ? size.normal : size.small))
+
+updateFib(bool live) =>
+    int xr = live ? bar_index + 8 : bar_index
+    for [i, ln] in fibL
+        float r = fibR.get(i)
+        float p = lvl(r)
+        ln.set_y1(p)
+        ln.set_y2(p)
+        ln.set_x2(xr)
+        fibT.get(i).set_xy(xr, p)
+        fibT.get(i).set_text((r == 0.618 ? "0.618 ENTRY" : str.tostring(r)) + "  " + str.tostring(p, format.mintick))
+
+fadeFib() =>
+    for ln in fibL
+        ln.set_color(color.new(fibCol, 75))
+    for lb in fibT
+        lb.set_textcolor(color.new(fibCol, 75))
+
+// ── New setups ───────────────────────────────────────────────────────────────
+bool takeUp = bosUp and allowLong and upTrend and flat and high - upA >= minLegAtr * atr
+bool takeDn = bosDn and allowShort and dnTrend and flat and dnA - low >= minLegAtr * atr
+if takeUp and takeDn
+    takeUp := false
+    takeDn := false
+if takeUp or takeDn
+    if active
+        strategy.cancel_all()
+        fadeFib()
+    dir      := takeUp ? 1 : -1
+    A        := takeUp ? upA : dnA
+    B        := takeUp ? high : low
+    active   := true
+    started  := false
+    setupBar := bar_index
+    drawFib()
+
+// ── Manage the pending setup ─────────────────────────────────────────────────
+float stopPx = A - dir * stopTicks * syminfo.mintick
+int   qtyTot = qty1 + qty2
+if active and flat
+    bool newExtreme = dir == 1 ? high > B : low < B
+    if newExtreme and not started
+        B := dir == 1 ? high : low           // leg still running: keep measuring it
+    bool ranAway = newExtreme and started      // left without filling us
+    if dir == 1 ? low <= lvl(0.382) : high >= lvl(0.382)
+        started := true
+    updateFib(true)
+
+    float p618 = lvl(0.618)
+    confTxt := confluence(p618)
+    bool broken  = dir == 1 ? close < A : close > A
+    bool expired = bar_index - setupBar > expiry
+    bool confOk  = not needConf or confTxt != ""
+    if broken or expired or ranAway or not canTrade or not confOk
+        strategy.cancel_all()
+        active := false
+        fadeFib()
+    else
+        float tp1 = lvl(0.0)
+        float tp2 = lvl(-0.272)
+        bool  go  = entryMode == "Limit at 0.618" or (dir == 1 ? (low <= p618 and close > p618 and close > open) : (high >= p618 and close < p618 and close < open))
+        if go
+            string e1 = dir == 1 ? "L1" : "S1"
+            string e2 = dir == 1 ? "L2" : "S2"
+            float  lim = entryMode == "Limit at 0.618" ? p618 : na
+            strategy.entry(e1, dir == 1 ? strategy.long : strategy.short, qty = qty1, limit = lim)
+            strategy.exit(e1 + " x", e1, stop = stopPx, limit = tp1)
+            if qty2 > 0
+                strategy.entry(e2, dir == 1 ? strategy.long : strategy.short, qty = qty2, limit = lim)
+                strategy.exit(e2 + " x", e2, stop = stopPx, limit = tp2)
+else if active and not flat
+    updateFib(true)
+    // Runner to breakeven once target 1 is done.
+    if qty2 > 0 and math.abs(strategy.position_size) < qtyTot and moveBE
+        string e2 = dir == 1 ? "L2" : "S2"
+        strategy.exit(e2 + " x", e2, stop = strategy.position_avg_price, limit = lvl(-0.272))
+
+// New position opened this bar → count it.
+bool opened = flat[1] and not flat
+if opened
+    tradesToday += 1
+    netAtEntry  := strategy.netprofit
+    label.new(bar_index, dir == 1 ? low : high, (dir == 1 ? "LONG 0.618" : "SHORT 0.618") + (confTxt != "" ? "\n★ " + confTxt : ""), yloc = dir == 1 ? yloc.belowbar : yloc.abovebar, style = dir == 1 ? label.style_label_up : label.style_label_down, color = color.new(color.black, 15), textcolor = goldCol, size = size.small)
+
+if flatNow and (not flat or active)
+    strategy.close_all("EOD flat")
+    strategy.cancel_all()
+    if active
+        active := false
+        updateFib(false)
+
+// ── Visuals ──────────────────────────────────────────────────────────────────
+barcolor(opened ? sigCol : na, title = "Entry candle")
+plot(vw, "VWAP", color.new(#00bcd4, 20), 2)
+plot(useHtf ? hE : na, "HTF EMA", color.new(#ff9800, 40), 1, plot.style_stepline)
+plot(not flat ? stopPx : na, "Stop", color.new(#f23645, 0), 2, plot.style_linebr)
+
+var table perf = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 75), border_width = 1)
+if barstate.islast
+    int   n  = strategy.closedtrades
+    int   w  = strategy.wintrades
+    int   l  = strategy.losstrades
+    float wr = n > 0 ? 100.0 * w / n : na
+    float pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    perf.cell(0, 0, "0.618 Day Trade", text_color = color.white, text_size = size.small)
+    perf.cell(1, 0, "", text_size = size.small)
+    perf.cell(0, 1, "Trades (legs)", text_color = color.white, text_size = size.small)
+    perf.cell(1, 1, str.tostring(n), text_color = color.white, text_size = size.small)
+    perf.cell(0, 2, "Win / Loss", text_color = color.white, text_size = size.small)
+    perf.cell(1, 2, str.tostring(w) + " / " + str.tostring(l), text_color = color.white, text_size = size.small)
+    perf.cell(0, 3, "Win rate", text_color = color.white, text_size = size.small)
+    perf.cell(1, 3, n > 0 ? str.tostring(wr, "#.0") + "%" : "–", text_color = n > 0 and wr >= 50 ? color.lime : color.orange, text_size = size.small)
+    perf.cell(0, 4, "Profit factor", text_color = color.white, text_size = size.small)
+    perf.cell(1, 4, na(pf) ? "–" : str.tostring(pf, "#.00"), text_color = na(pf) ? color.gray : pf >= 1 ? color.lime : color.red, text_size = size.small)
+    perf.cell(0, 5, "Net P&L ($)", text_color = color.white, text_size = size.small)
+    perf.cell(1, 5, str.tostring(strategy.netprofit, "#,###"), text_color = strategy.netprofit >= 0 ? color.lime : color.red, text_size = size.small)
+
+alertcondition(takeUp, "Long setup", "Bullish break on {{ticker}}: 0.618 buy limit armed")
+alertcondition(takeDn, "Short setup", "Bearish break on {{ticker}}: 0.618 sell limit armed")
+alertcondition(opened, "0.618 entry filled", "0.618 entry filled on {{ticker}} @ {{close}}")
