@@ -112,3 +112,10 @@ Each leg (L1/L2) shows as its own trade in the Strategy Tester's list of trades.
 - **Results table** (top-right): trades, wins/losses, **win rate**, profit factor, average win/loss and net P&L. The Strategy Tester tab shows the same numbers in full.
 - **Chart:** works on 1–5 minute charts. The 9:30 candle is painted yellow.
 - **Costs:** $2.50/contract/side commission and 1 tick of slippage are included.
+
+## `first_candle_930_15m_strategy.pine`: 9:30 First 15-Min Candle (Pine Script v6 **strategy**)
+
+The same strategy as above, using the **09:30–09:45 ET fifteen-minute candle**. Entry is at 09:45 on the 15-minute chart.
+
+- **Unchanged:** the stop rule (far end of the wick, minimum 15 pts), the liquidity targets, the brackets and the results table.
+- **Chart:** built for the 15-minute chart. It also runs on 1/3/5-minute charts, rebuilding the 15-minute candle from the smaller bars.

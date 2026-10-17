@@ -1,0 +1,265 @@
+//@version=6
+strategy("9:30 First 15-Min Candle — Direction Trade", shorttitle = "930 First 15m", overlay = true, initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.cash_per_contract, commission_value = 2.5, slippage = 1, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500, max_bars_back = 2000)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rules
+//  • Wait for the 09:30–09:45 ET fifteen-minute candle to close.
+//      Green candle → LONG.  Red candle → SHORT.  Doji (open = close) → no trade.
+//  • Entry at the open of the next bar (09:45 on a 15-min chart).
+//  • Stop: the far end of the candle's wick (low for longs, high for shorts),
+//    but never closer than 15 points from entry.
+//  • Target: the NEXT LEVEL OF LIQUIDITY in the trade direction, the nearest of:
+//      prior-day RTH high/low · overnight high/low · prior-week high/low ·
+//      untaken swing highs/lows (resting stops)
+//    The level must be at least "Min reward:risk" away; otherwise the next one
+//    further out is used. With no level available, a fixed R multiple is used.
+//  • One trade per day, flat by 15:55 ET.
+// Built for the 15-minute chart. Also works on 1/3/5-minute charts (the 9:30
+// fifteen-minute candle is rebuilt from the smaller bars).
+// ─────────────────────────────────────────────────────────────────────────────
+
+string TZ = "America/New_York"
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpR = "Risk"
+minStopPts = input.float(15.0, "Minimum stop (points)", minval = 0.25, step = 0.25, group = grpR)
+stopBufPts = input.float(0.0, "Extra buffer beyond wick (points)", minval = 0.0, step = 0.25, group = grpR)
+minRR      = input.float(1.0, "Min reward:risk for a liquidity target", minval = 0.0, step = 0.25, group = grpR, tooltip = "Liquidity closer than this many R is skipped and the next level out is used. 0 = always take the nearest level.")
+fallbackRR = input.float(2.0, "Fallback target if no level (R)", minval = 0.25, step = 0.25, group = grpR)
+qty        = input.int(1, "Contracts", minval = 1, group = grpR)
+
+grpL = "Liquidity levels"
+usePD    = input.bool(true, "Prior-day RTH high/low", group = grpL)
+useON    = input.bool(true, "Overnight high/low", group = grpL)
+usePW    = input.bool(true, "Prior-week high/low", group = grpL)
+useSwing = input.bool(true, "Untaken swing highs/lows", group = grpL)
+swingLen = input.int(5, "Swing strength (bars each side)", minval = 1, group = grpL)
+
+grpS = "Session"
+flatSess  = input.session("1555-1600", "Flatten all (ET)", group = grpS)
+allowLong  = input.bool(true, "Take longs", group = grpS)
+allowShort = input.bool(true, "Take shorts", group = grpS)
+
+grpD = "Display"
+candleCol = input.color(#FFFF00, "9:30 candle", group = grpD)
+
+if timeframe.in_seconds() > 900 or 900 % timeframe.in_seconds() != 0
+    runtime.error("Use a 15-minute chart (or 1/3/5-minute).")
+
+// ── Sessions ─────────────────────────────────────────────────────────────────
+inSess(string s) => not na(time(timeframe.period, s, TZ))
+
+bool newDay   = timeframe.change("D")          // CME Globex day starts 18:00 ET
+bool inRTH    = inSess("0930-1600")
+bool rthStart = inRTH and not inRTH[1]
+bool rthEnd   = not inRTH and inRTH[1]
+bool inFirst  = inSess("0930-0945")
+bool firstDone = inFirst and hour(time_close, TZ) == 9 and minute(time_close, TZ) == 45
+bool flatNow  = inSess(flatSess)
+
+// ── Rebuild the 09:30 fifteen-minute candle ─────────────────────────────────────
+var float fO = na
+var float fH = na
+var float fL = na
+if inFirst and not inFirst[1]
+    fO := open
+    fH := high
+    fL := low
+else if inFirst
+    fH := math.max(fH, high)
+    fL := math.min(fL, low)
+float fC = close
+
+// ── Liquidity levels ─────────────────────────────────────────────────────────
+// Prior-day RTH high/low
+var float rthH = na
+var float rthL = na
+var float pdH  = na
+var float pdL  = na
+if rthStart
+    rthH := high
+    rthL := low
+else if inRTH
+    rthH := math.max(rthH, high)
+    rthL := math.min(rthL, low)
+if rthEnd
+    pdH := rthH
+    pdL := rthL
+
+// Overnight high/low (18:00 → 09:30)
+bool inPost = inSess("1600-1800")
+var float onH = na
+var float onL = na
+if newDay
+    onH := high
+    onL := low
+else if not inRTH and not inPost
+    onH := math.max(onH, high)
+    onL := math.min(onL, low)
+
+// Prior-week high/low (non-repainting)
+[pwH, pwL] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+// Untaken swing highs/lows: removed once price trades through them
+var array<float> swH = array.new<float>()
+var array<float> swL = array.new<float>()
+if swH.size() > 0
+    for i = swH.size() - 1 to 0
+        if high > swH.get(i)
+            swH.remove(i)
+if swL.size() > 0
+    for i = swL.size() - 1 to 0
+        if low < swL.get(i)
+            swL.remove(i)
+float ph = ta.pivothigh(high, swingLen, swingLen)
+float pl = ta.pivotlow(low, swingLen, swingLen)
+if not na(ph)
+    swH.push(ph)
+    if swH.size() > 60
+        swH.shift()
+if not na(pl)
+    swL.push(pl)
+    if swL.size() > 60
+        swL.shift()
+
+// Nearest qualifying level beyond `minPrice` (longs) or below it (shorts).
+type Lvl
+    float  p
+    string n
+
+pick(array<Lvl> lv, bool isLong, float minDistPrice) =>
+    float  best  = na
+    string bestN = ""
+    for l in lv
+        bool ok = isLong ? l.p >= minDistPrice : l.p <= minDistPrice
+        if ok and not na(l.p) and (na(best) or (isLong ? l.p < best : l.p > best))
+            best  := l.p
+            bestN := l.n
+    [best, bestN]
+
+// ── Trade logic ──
+var box  riskBx = na
+var box  rewBx  = na
+var bool bracketLive = false
+────────────────────────────────────────────────────────────
+var bool  tradedToday = false
+var float entryRef = na
+var float stopPx   = na
+var float tgtPx    = na
+if newDay
+    tradedToday := false
+    entryRef    := na
+    stopPx      := na
+    tgtPx       := na
+
+bool isGreen = fC > fO
+bool isRed   = fC < fO
+bool goLong  = firstDone and not tradedToday and isGreen and allowLong
+bool goShort = firstDone and not tradedToday and isRed and allowShort
+
+if goLong or goShort
+    tradedToday := true
+    entryRef    := fC
+    float wickStop = goLong ? fL - stopBufPts : fH + stopBufPts
+    stopPx := goLong ? math.min(wickStop, fC - minStopPts) : math.max(wickStop, fC + minStopPts)
+    float risk = math.abs(fC - stopPx)
+
+    array<Lvl> lv = array.new<Lvl>()
+    if goLong
+        if usePD
+            lv.push(Lvl.new(pdH, "PDH"))
+            lv.push(Lvl.new(pdL, "PDL"))
+        if useON
+            lv.push(Lvl.new(onH, "ONH"))
+            lv.push(Lvl.new(onL, "ONL"))
+        if usePW
+            lv.push(Lvl.new(pwH, "PWH"))
+            lv.push(Lvl.new(pwL, "PWL"))
+        if useSwing
+            for p in swH
+                lv.push(Lvl.new(p, "Swing high"))
+    else
+        if usePD
+            lv.push(Lvl.new(pdL, "PDL"))
+            lv.push(Lvl.new(pdH, "PDH"))
+        if useON
+            lv.push(Lvl.new(onL, "ONL"))
+            lv.push(Lvl.new(onH, "ONH"))
+        if usePW
+            lv.push(Lvl.new(pwL, "PWL"))
+            lv.push(Lvl.new(pwH, "PWH"))
+        if useSwing
+            for p in swL
+                lv.push(Lvl.new(p, "Swing low"))
+
+    float minDist = goLong ? fC + minRR * risk : fC - minRR * risk
+    [tp, tpName] = pick(lv, goLong, minDist)
+    float  tgt   = tp
+    string tName = tpName
+    if na(tgt)
+        tgt   := goLong ? fC + fallbackRR * risk : fC - fallbackRR * risk
+        tName := str.tostring(fallbackRR) + "R (no level)"
+    tgtPx := tgt
+
+    if goLong
+        strategy.entry("Long", strategy.long, qty = qty)
+        strategy.exit("Long exit", "Long", stop = stopPx, limit = tgtPx)
+    else
+        strategy.entry("Short", strategy.short, qty = qty)
+        strategy.exit("Short exit", "Short", stop = stopPx, limit = tgtPx)
+
+    float rr = math.abs(tgtPx - fC) / risk
+    string txt = (goLong ? "LONG" : "SHORT") + "  " + str.tostring(rr, "#.0") + "R\nStop " + str.tostring(stopPx, format.mintick) + " (" + str.tostring(risk, "#.##") + " pts)\nTarget " + str.tostring(tgtPx, format.mintick) + " · " + tName
+    // Bracket: red stop box + green target box, extended while the trade is open.
+    riskBx := box.new(bar_index, math.max(fC, stopPx), bar_index + 1, math.min(fC, stopPx), border_color = color.new(#f23645, 40), bgcolor = color.new(#f23645, 80))
+    rewBx  := box.new(bar_index, math.max(fC, tgtPx), bar_index + 1, math.min(fC, tgtPx), border_color = color.new(#089981, 40), bgcolor = color.new(#089981, 80))
+    bracketLive := true
+    label.new(bar_index, goLong ? fL : fH, txt, style = goLong ? label.style_label_up : label.style_label_down, color = color.new(color.black, 15), textcolor = goLong ? color.lime : color.red, size = size.small)
+
+if flatNow and strategy.position_size != 0
+    strategy.close_all("EOD flat")
+
+// Keep the bracket growing until the trade closes, then freeze it.
+if bracketLive
+    riskBx.set_right(bar_index + 1)
+    rewBx.set_right(bar_index + 1)
+    bool closed = strategy.position_size == 0 and bar_index > riskBx.get_left() + 1
+    if closed
+        riskBx.set_right(bar_index)
+        rewBx.set_right(bar_index)
+        bracketLive := false
+
+// ── Performance table ────────────────────────────────────────────────────────
+var table perf = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 75), border_width = 1)
+if barstate.islast
+    int   n   = strategy.closedtrades
+    int   w   = strategy.wintrades
+    int   l   = strategy.losstrades
+    float wr  = n > 0 ? 100.0 * w / n : na
+    float pf  = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    float avW = w > 0 ? strategy.grossprofit / w : na
+    float avL = l > 0 ? strategy.grossloss / l : na
+    perf.cell(0, 0, "9:30 First 15m Candle", text_color = color.white, text_size = size.small)
+    perf.cell(1, 0, "", text_size = size.small)
+    perf.cell(0, 1, "Trades", text_color = color.white, text_size = size.small)
+    perf.cell(1, 1, str.tostring(n), text_color = color.white, text_size = size.small)
+    perf.cell(0, 2, "Win / Loss", text_color = color.white, text_size = size.small)
+    perf.cell(1, 2, str.tostring(w) + " / " + str.tostring(l), text_color = color.white, text_size = size.small)
+    perf.cell(0, 3, "Win rate", text_color = color.white, text_size = size.small)
+    perf.cell(1, 3, n > 0 ? str.tostring(wr, "#.0") + "%" : "–", text_color = n > 0 and wr >= 50 ? color.lime : color.orange, text_size = size.small)
+    perf.cell(0, 4, "Profit factor", text_color = color.white, text_size = size.small)
+    perf.cell(1, 4, na(pf) ? "–" : str.tostring(pf, "#.00"), text_color = na(pf) ? color.gray : pf >= 1 ? color.lime : color.red, text_size = size.small)
+    perf.cell(0, 5, "Avg win / loss ($)", text_color = color.white, text_size = size.small)
+    perf.cell(1, 5, (na(avW) ? "–" : str.tostring(avW, "#")) + " / " + (na(avL) ? "–" : str.tostring(avL, "#")), text_color = color.white, text_size = size.small)
+    perf.cell(0, 6, "Net P&L ($)", text_color = color.white, text_size = size.small)
+    perf.cell(1, 6, str.tostring(strategy.netprofit, "#,###"), text_color = strategy.netprofit >= 0 ? color.lime : color.red, text_size = size.small)
+
+// ── Visuals ──────────────────────────────────────────────────────────────────
+barcolor(inFirst ? candleCol : na, title = "9:30 candle")
+bool showLines = not na(entryRef) and inRTH
+plot(showLines ? entryRef : na, "Entry",  color.new(color.white, 20), 1, plot.style_linebr)
+plot(showLines ? stopPx   : na, "Stop",   color.new(#f23645, 0), 2, plot.style_linebr)
+plot(showLines ? tgtPx    : na, "Target", color.new(#089981, 0), 2, plot.style_linebr)
+
+alertcondition(goLong,  "9:30 long",  "9:30 15m candle green: LONG {{ticker}} @ {{close}}")
+alertcondition(goShort, "9:30 short", "9:30 15m candle red: SHORT {{ticker}} @ {{close}}")
