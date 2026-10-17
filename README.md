@@ -129,3 +129,14 @@ Marks when price **sweeps the day's opening price**: it trades through the open 
 - **Failed breaks (optional):** set `Closes allowed past the open` to 1–3 to also count a failed break, where price closes past the open for a few bars and then closes back.
 - **Chart:** the sweep candle is painted bright yellow, and the opening price is drawn as a line with a label.
 - **Alerts:** bullish, bearish, or either.
+
+## `fib_continuation_strategy.pine`: Fib Retracement Continuation (Pine Script v6 **strategy**)
+
+- **Leg:** a run of 3+ consecutive green candles (or red, for shorts) that's at least 1.5× ATR in size forms an impulse leg. A fib is drawn on it: 1.0 at the leg start, 0 at the leg extreme.
+- **Entry:** a limit order at **0.5** (rebalance), **0.618** or **0.786** (the golden pocket, with a smaller stop), or scaling in across all three.
+  - Optional: wait for a rejection candle at the level instead of a resting limit.
+- **Stop:** beyond the 1.0 level.
+- **Target:** the 0 level (retest of the leg extreme), or the −0.272 / −0.618 extension.
+- **Multi-timeframe:** a 15m EMA bias filter. The leg can be measured on a higher timeframe (e.g. 5m) while entering on the 1m chart.
+- **Limits:** unfilled setups are cancelled after 60 bars, on a close beyond 1.0, or outside the session. Flat by 15:55 ET.
+- **On the chart:** fib lines with a shaded golden pocket, the entry candle painted yellow, stop/target lines, and a win-rate table.
