@@ -1,5 +1,5 @@
 //@version=6
-strategy("0.618 Day Trade — Break & Retrace", shorttitle = "Fib 618 DT", overlay = true, pyramiding = 2, initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.cash_per_contract, commission_value = 2.5, slippage = 1, max_lines_count = 500, max_labels_count = 500, max_bars_back = 1000)
+strategy("0.618 Day Trade — Break & Retrace", shorttitle = "Fib 618 DT", overlay = true, pyramiding = 2, initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.cash_per_contract, commission_value = 2.5, slippage = 1, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 200, max_bars_back = 1000)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 0.618 BREAK & RETRACE
@@ -52,6 +52,9 @@ allowShort = input.bool(true, "Take shorts", group = grpF)
 grpD = "Display"
 goldCol = input.color(#ffd600, "0.618 level", group = grpD)
 fibCol  = input.color(#9e9e9e, "Other fib levels", group = grpD)
+zeroCol = input.color(#00e676, "0 level (leg extreme / target)", group = grpD)
+oneCol  = input.color(#ff5252, "1 level (leg start / stop side)", group = grpD)
+shadeRng = input.bool(true, "Shade the 0–1 range", group = grpD)
 sigCol  = input.color(#FFFF00, "Entry candle", group = grpD)
 keepDone = input.bool(false, "Keep fibs of completed trades on the chart", group = grpD, tooltip = "Off: only the current setup's fib is shown. Broken, expired and finished fibs are deleted.")
 
@@ -155,6 +158,13 @@ lvl(float r) => B - r * (B - A)
 var array<float> fibR = array.from(-0.272, 0.0, 0.382, 0.5, 0.618, 0.786, 1.0)
 var array<line>  fibL = array.new<line>()
 var array<label> fibT = array.new<label>()
+var array<box>   fibB = array.new<box>()
+
+// Names and colours: 0 and 1 mark the range being measured.
+fibName(float r, int d) =>
+    r == 0.618 ? "0.618 ENTRY" : r == 0 ? (d == 1 ? "0 · range high" : "0 · range low") : r == 1 ? (d == 1 ? "1 · range low" : "1 · range high") : str.tostring(r)
+fibColor(float r, color mid) =>
+    r == 0 ? zeroCol : r == 1 ? oneCol : mid
 
 // Remove the current fib from the chart (disrespected, expired or finished).
 clearFib() =>
@@ -162,18 +172,24 @@ clearFib() =>
         ln.delete()
     for lb in fibT
         lb.delete()
+    for b in fibB
+        b.delete()
     fibL.clear()
     fibT.clear()
+    fibB.clear()
 
 drawFib() =>
     clearFib()
     for r in fibR
         float p  = lvl(r)
         bool  g  = r == 0.618
-        color c  = g ? goldCol : fibCol
-        string t = (g ? "0.618 ENTRY" : str.tostring(r)) + "  " + str.tostring(p, format.mintick)
-        fibL.push(line.new(setupBar, p, bar_index + 8, p, color = g ? c : color.new(c, 40), width = g ? 3 : 1, style = (r == 0.382 or r == 0.5 or r == 0.786) ? line.style_dotted : line.style_solid))
-        fibT.push(label.new(bar_index + 8, p, t, style = label.style_label_left, color = color.new(color.black, 100), textcolor = g ? c : color.new(c, 30), size = g ? size.normal : size.small))
+        bool  e  = r == 0 or r == 1
+        color c  = g ? goldCol : fibColor(r, fibCol)
+        string t = fibName(r, dir) + "  " + str.tostring(p, format.mintick)
+        fibL.push(line.new(setupBar, p, bar_index + 8, p, color = (g or e) ? c : color.new(c, 40), width = g ? 3 : e ? 2 : 1, style = (r == 0.382 or r == 0.5 or r == 0.786) ? line.style_dotted : line.style_solid))
+        fibT.push(label.new(bar_index + 8, p, t, style = label.style_label_left, color = color.new(color.black, 100), textcolor = (g or e) ? c : color.new(c, 30), size = (g or e) ? size.normal : size.small))
+    if shadeRng
+        fibB.push(box.new(setupBar, math.max(A, B), bar_index + 8, math.min(A, B), border_color = color.new(color.white, 100), bgcolor = color.new(dir == 1 ? zeroCol : oneCol, 94)))
 
 updateFib(bool live) =>
     int xr = live ? bar_index + 8 : bar_index
@@ -184,7 +200,11 @@ updateFib(bool live) =>
         ln.set_y2(p)
         ln.set_x2(xr)
         fibT.get(i).set_xy(xr, p)
-        fibT.get(i).set_text((r == 0.618 ? "0.618 ENTRY" : str.tostring(r)) + "  " + str.tostring(p, format.mintick))
+        fibT.get(i).set_text(fibName(r, dir) + "  " + str.tostring(p, format.mintick))
+    for b in fibB
+        b.set_top(math.max(A, B))
+        b.set_bottom(math.min(A, B))
+        b.set_right(xr)
 
 var int   tradesToday = 0
 var int   lossesToday = 0
@@ -200,6 +220,7 @@ if flat and strategy.position_size[1] != 0
         updateFib(false)
         fibL.clear()        // forget them so they stay where they are
         fibT.clear()
+        fibB.clear()
     else
         clearFib()
     if strategy.netprofit < netAtEntry
@@ -375,9 +396,11 @@ drawHtf(string tf, int d, float a, float b, color c) =>
     string name = timeframe.in_seconds(tf) >= 3600 ? str.tostring(timeframe.in_seconds(tf) / 3600) + "h" : str.tostring(timeframe.in_seconds(tf) / 60) + "m"
     for r in htfR
         float p = b - r * (b - a)
-        bool  g = r == 0.618
-        htfL.push(line.new(bar_index - 40, p, bar_index + 30, p, color = g ? c : color.new(c, 45), width = g ? 2 : 1, style = g ? line.style_solid : line.style_dashed))
-        htfT.push(label.new(bar_index + 30, p, name + (d == 1 ? " ▲ " : " ▼ ") + str.tostring(r) + "  " + str.tostring(p, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = g ? c : color.new(c, 30), size = size.small))
+        bool  g  = r == 0.618
+        bool  e  = r == 0 or r == 1
+        color lc = fibColor(r, c)
+        htfL.push(line.new(bar_index - 40, p, bar_index + 30, p, color = (g or e) ? lc : color.new(lc, 45), width = (g or e) ? 2 : 1, style = (g or e) ? line.style_solid : line.style_dashed))
+        htfT.push(label.new(bar_index + 30, p, name + (d == 1 ? " ▲ " : " ▼ ") + (g ? "0.618" : fibName(r, d)) + "  " + str.tostring(p, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = (g or e) ? lc : color.new(lc, 30), size = size.small))
 
 if barstate.islast
     for ln in htfL
