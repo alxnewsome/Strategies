@@ -53,6 +53,15 @@ grpD = "Display"
 goldCol = input.color(#ffd600, "0.618 level", group = grpD)
 fibCol  = input.color(#9e9e9e, "Other fib levels", group = grpD)
 sigCol  = input.color(#FFFF00, "Entry candle", group = grpD)
+keepDone = input.bool(false, "Keep fibs of completed trades on the chart", group = grpD, tooltip = "Off: only the current setup's fib is shown. Broken, expired and finished fibs are deleted.")
+
+grpH = "Higher-timeframe fibs"
+showH1 = input.bool(true, "Show HTF fib 1", group = grpH, inline = "h1")
+htf1   = input.timeframe("15", "", group = grpH, inline = "h1")
+col1   = input.color(#ba68c8, "", group = grpH, inline = "h1")
+showH2 = input.bool(true, "Show HTF fib 2", group = grpH, inline = "h2")
+htf2   = input.timeframe("60", "", group = grpH, inline = "h2")
+col2   = input.color(#4fc3f7, "", group = grpH, inline = "h2")
 
 // ── Sessions & reference levels ──────────────────────────────────────────────
 inSess(string s) => not na(time(timeframe.period, s, TZ))
@@ -142,6 +151,41 @@ var string confTxt = ""
 
 lvl(float r) => B - r * (B - A)
 
+// ── Fib drawing ──────────────────────────────────────────────────────────────
+var array<float> fibR = array.from(-0.272, 0.0, 0.382, 0.5, 0.618, 0.786, 1.0)
+var array<line>  fibL = array.new<line>()
+var array<label> fibT = array.new<label>()
+
+// Remove the current fib from the chart (disrespected, expired or finished).
+clearFib() =>
+    for ln in fibL
+        ln.delete()
+    for lb in fibT
+        lb.delete()
+    fibL.clear()
+    fibT.clear()
+
+drawFib() =>
+    clearFib()
+    for r in fibR
+        float p  = lvl(r)
+        bool  g  = r == 0.618
+        color c  = g ? goldCol : fibCol
+        string t = (g ? "0.618 ENTRY" : str.tostring(r)) + "  " + str.tostring(p, format.mintick)
+        fibL.push(line.new(setupBar, p, bar_index + 8, p, color = g ? c : color.new(c, 40), width = g ? 3 : 1, style = (r == 0.382 or r == 0.5 or r == 0.786) ? line.style_dotted : line.style_solid))
+        fibT.push(label.new(bar_index + 8, p, t, style = label.style_label_left, color = color.new(color.black, 100), textcolor = g ? c : color.new(c, 30), size = g ? size.normal : size.small))
+
+updateFib(bool live) =>
+    int xr = live ? bar_index + 8 : bar_index
+    for [i, ln] in fibL
+        float r = fibR.get(i)
+        float p = lvl(r)
+        ln.set_y1(p)
+        ln.set_y2(p)
+        ln.set_x2(xr)
+        fibT.get(i).set_xy(xr, p)
+        fibT.get(i).set_text((r == 0.618 ? "0.618 ENTRY" : str.tostring(r)) + "  " + str.tostring(p, format.mintick))
+
 var int   tradesToday = 0
 var int   lossesToday = 0
 var float netAtEntry  = 0.0
@@ -152,6 +196,12 @@ bool flat = strategy.position_size == 0
 if flat and strategy.position_size[1] != 0
     strategy.cancel_all()
     active := false
+    if keepDone
+        updateFib(false)
+        fibL.clear()        // forget them so they stay where they are
+        fibT.clear()
+    else
+        clearFib()
     if strategy.netprofit < netAtEntry
         lossesToday += 1
 bool canTrade = inWin and flat and tradesToday < maxTrades and lossesToday < maxLosses
@@ -176,39 +226,6 @@ confluence(float p) =>
         hits.push("Open")
     hits.join(" + ")
 
-// ── Fib drawing ──────────────────────────────────────────────────────────────
-var array<float> fibR = array.from(-0.272, 0.0, 0.382, 0.5, 0.618, 0.786, 1.0)
-var array<line>  fibL = array.new<line>()
-var array<label> fibT = array.new<label>()
-
-drawFib() =>
-    fibL.clear()
-    fibT.clear()
-    for r in fibR
-        float p  = lvl(r)
-        bool  g  = r == 0.618
-        color c  = g ? goldCol : fibCol
-        string t = (g ? "0.618 ENTRY" : str.tostring(r)) + "  " + str.tostring(p, format.mintick)
-        fibL.push(line.new(setupBar, p, bar_index + 8, p, color = g ? c : color.new(c, 40), width = g ? 3 : 1, style = (r == 0.382 or r == 0.5 or r == 0.786) ? line.style_dotted : line.style_solid))
-        fibT.push(label.new(bar_index + 8, p, t, style = label.style_label_left, color = color.new(color.black, 100), textcolor = g ? c : color.new(c, 30), size = g ? size.normal : size.small))
-
-updateFib(bool live) =>
-    int xr = live ? bar_index + 8 : bar_index
-    for [i, ln] in fibL
-        float r = fibR.get(i)
-        float p = lvl(r)
-        ln.set_y1(p)
-        ln.set_y2(p)
-        ln.set_x2(xr)
-        fibT.get(i).set_xy(xr, p)
-        fibT.get(i).set_text((r == 0.618 ? "0.618 ENTRY" : str.tostring(r)) + "  " + str.tostring(p, format.mintick))
-
-fadeFib() =>
-    for ln in fibL
-        ln.set_color(color.new(fibCol, 75))
-    for lb in fibT
-        lb.set_textcolor(color.new(fibCol, 75))
-
 // ── New setups ───────────────────────────────────────────────────────────────
 bool takeUp = bosUp and allowLong and upTrend and flat and high - upA >= minLegAtr * atr
 bool takeDn = bosDn and allowShort and dnTrend and flat and dnA - low >= minLegAtr * atr
@@ -218,7 +235,7 @@ if takeUp and takeDn
 if takeUp or takeDn
     if active
         strategy.cancel_all()
-        fadeFib()
+        clearFib()
     dir      := takeUp ? 1 : -1
     A        := takeUp ? upA : dnA
     B        := takeUp ? high : low
@@ -247,7 +264,7 @@ if active and flat
     if broken or expired or ranAway or not canTrade or not confOk
         strategy.cancel_all()
         active := false
-        fadeFib()
+        clearFib()
     else
         float tp1 = lvl(0.0)
         float tp2 = lvl(-0.272)
@@ -280,7 +297,99 @@ if flatNow and (not flat or active)
     strategy.cancel_all()
     if active
         active := false
-        updateFib(false)
+        clearFib()
+
+// ── Higher-timeframe fibs ────────────────────────────────────────────────────
+// The current break-and-retrace leg on a higher timeframe. It disappears once
+// it's disrespected (close beyond 1.0) or completed (new extreme after the
+// pullback), so only live levels are shown.
+htfFib(int l, int r, float minAtr) =>
+    float a  = ta.atr(14)
+    float hp = ta.pivothigh(high, l, r)
+    float lp = ta.pivotlow(low, l, r)
+    var float lph = na
+    var int   lphB = na
+    var bool  phB = true
+    var float lpl = na
+    var int   lplB = na
+    var bool  plB = true
+    var int   d  = 0
+    var float fA = na
+    var float fB = na
+    var bool  on = false
+    var bool  st = false
+    if not na(hp)
+        lph  := hp
+        lphB := bar_index - r
+        phB  := false
+    if not na(lp)
+        lpl  := lp
+        lplB := bar_index - r
+        plB  := false
+    bool up = not phB and close > lph
+    bool dn = not plB and close < lpl
+    if up
+        phB := true
+    if dn
+        plB := true
+    if on
+        bool beyond = d == 1 ? high > fB : low < fB
+        if beyond and not st
+            fB := d == 1 ? high : low
+        else if beyond and st
+            on := false                                    // completed
+        if on and (d == 1 ? low <= fB - 0.382 * (fB - fA) : high >= fB - 0.382 * (fB - fA))
+            st := true
+        if on and (d == 1 ? close < fA : close > fA)
+            on := false                                    // disrespected
+    if up and not dn
+        float x = low
+        for k = 1 to math.max(math.min(bar_index - lphB, 300), 1)
+            x := math.min(x, low[k])
+        if high - x >= minAtr * a
+            d  := 1
+            fA := x
+            fB := high
+            on := true
+            st := false
+    else if dn and not up
+        float x = high
+        for k = 1 to math.max(math.min(bar_index - lplB, 300), 1)
+            x := math.max(x, high[k])
+        if x - low >= minAtr * a
+            d  := -1
+            fA := x
+            fB := low
+            on := true
+            st := false
+    [d[1], fA[1], fB[1], on[1]]
+
+[h1d, h1A, h1B, h1on] = request.security(syminfo.tickerid, htf1, htfFib(swL, swR, minLegAtr), lookahead = barmerge.lookahead_on)
+[h2d, h2A, h2B, h2on] = request.security(syminfo.tickerid, htf2, htfFib(swL, swR, minLegAtr), lookahead = barmerge.lookahead_on)
+
+var array<line>  htfL = array.new<line>()
+var array<label> htfT = array.new<label>()
+var array<float> htfR = array.from(0.0, 0.5, 0.618, 0.786, 1.0)
+
+drawHtf(string tf, int d, float a, float b, color c) =>
+    string name = timeframe.in_seconds(tf) >= 3600 ? str.tostring(timeframe.in_seconds(tf) / 3600) + "h" : str.tostring(timeframe.in_seconds(tf) / 60) + "m"
+    for r in htfR
+        float p = b - r * (b - a)
+        bool  g = r == 0.618
+        htfL.push(line.new(bar_index - 40, p, bar_index + 30, p, color = g ? c : color.new(c, 45), width = g ? 2 : 1, style = g ? line.style_solid : line.style_dashed))
+        htfT.push(label.new(bar_index + 30, p, name + (d == 1 ? " ▲ " : " ▼ ") + str.tostring(r) + "  " + str.tostring(p, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = g ? c : color.new(c, 30), size = size.small))
+
+if barstate.islast
+    for ln in htfL
+        ln.delete()
+    for lb in htfT
+        lb.delete()
+    htfL.clear()
+    htfT.clear()
+    if showH1 and h1on and timeframe.in_seconds(htf1) >= timeframe.in_seconds()
+        drawHtf(htf1, h1d, h1A, h1B, col1)
+    if showH2 and h2on and timeframe.in_seconds(htf2) >= timeframe.in_seconds()
+        drawHtf(htf2, h2d, h2A, h2B, col2)
 
 // ── Visuals ──────────────────────────────────────────────────────────────────
 barcolor(opened ? sigCol : na, title = "Entry candle")

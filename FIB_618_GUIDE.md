@@ -26,6 +26,10 @@ Why 0.618 works as a day-trade entry:
 
 While the leg is still pushing up (before any pullback to 0.382), the 0 level keeps moving up with each new high, so the fib always measures the full move.
 
+## What you see on the chart
+- **One fib at a time.** Only the current setup's fib is drawn. It's deleted when the setup is broken (close beyond 1.0), expires, is missed (price makes a new high or low after pulling back), or the trade finishes. Turn on *Keep fibs of completed trades* to keep traded ones for review.
+- **Higher-timeframe fibs** (15m in purple, 1h in blue by default). Each shows the **current** break-and-retrace leg on that timeframe, with its 0 / 0.5 / 0.618 / 0.786 / 1 levels labelled, e.g. `15m ▲ 0.618`. An HTF fib disappears when it's disrespected or completed, so what's on the chart is always live. When a 5m 0.618 lines up with a 15m or 1h 0.618, that's a stronger entry.
+
 ## How to use it day to day
 1. **Chart:** 5-minute for setups. If you want tighter fills, run the same settings on a 3-minute or 2-minute chart. Keep the HTF filter at 15 minutes.
 2. **Times (New York):** trades only from **9:45–11:30** and **13:30–15:45**. The first 15 minutes are too erratic, and lunch is too thin. Everything is flat by 15:55.

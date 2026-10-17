@@ -148,4 +148,6 @@ Marks when price **sweeps the day's opening price**: it trades through the open 
 - **Exits:** half at the 0 level, the runner at the −0.272 extension with its stop moved to breakeven.
 - **Filters:** VWAP, 15m trend, minimum leg size, trading windows, and daily trade/loss limits. Optionally requires a key level (VWAP, PDH/PDL/PDC, overnight high/low, open) near the 0.618.
 
+Only the current fib is drawn; broken, expired and finished fibs are deleted. The current 15m and 1h fibs are overlaid too, and also vanish once disrespected.
+
 Full usage guide, including when **not** to use it: [`FIB_618_GUIDE.md`](FIB_618_GUIDE.md).
