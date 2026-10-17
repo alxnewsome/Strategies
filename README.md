@@ -151,3 +151,14 @@ Marks when price **sweeps the day's opening price**: it trades through the open 
 Only the current fib is drawn; broken, expired and finished fibs are deleted. The current 15m and 1h fibs are overlaid too, and also vanish once disrespected.
 
 Full usage guide, including when **not** to use it: [`FIB_618_GUIDE.md`](FIB_618_GUIDE.md).
+
+## `gap_fill_strategy.pine`: Gap Fill for NQ / ES (Pine Script v6 **strategy**)
+
+Fades small opening gaps back toward the prior 16:00 ET close.
+
+- **Qualifying gap:** between 0.10% and 0.60%, with the open inside the prior day's range.
+- **Entry:** after the first 5-min candle closes in the fill direction.
+- **Stop:** beyond that candle, with a minimum distance. The trade is skipped if the stop is larger than the distance to a full fill.
+- **Exits:** half the position at a 50% gap fill, the runner at the full fill with its stop moved to breakeven. A time stop closes everything at 11:30 ET.
+- **On the chart:** green/red ★ entries and a drawn bracket (stop, TP1, TP2) on every trade.
+- **Results table:** shows the **base rate** (how often qualifying gaps reached 50% and 100% fill on your data) next to the strategy's win rate, profit factor, drawdown and average trade.

@@ -1,0 +1,226 @@
+//@version=6
+strategy("Gap Fill — NQ / ES", shorttitle = "Gap Fill", overlay = true, pyramiding = 2, initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.cash_per_contract, commission_value = 2.5, slippage = 1, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GAP FILL (fade the opening gap back toward yesterday's close)
+//
+// Why it has a high win rate: when NQ/ES opens away from the prior 16:00 close
+// by a SMALL amount and still INSIDE yesterday's range, the overnight move is
+// usually positioning, not news. Price tends to drift back toward the prior
+// close early in the session. The first target is only HALF the gap, which is
+// reached far more often than the full fill.
+//
+//  1. At 09:30 ET measure the gap: RTH open − prior RTH close.
+//  2. Trade only gaps between 0.10% and 0.60% with the open inside the prior
+//     day's range.
+//  3. Wait for the first 5-min candle to close in the fill direction (red on a
+//     gap up → SHORT, green on a gap down → LONG).
+//  4. Stop beyond the first 5-min candle (minimum distance enforced). Skip if
+//     the stop is bigger than the distance to a full fill.
+//  5. Target 1: 50% of the gap filled. Target 2: full fill (prior close).
+//     After target 1, the runner's stop moves to breakeven.
+//  6. Anything still open at 11:30 ET is closed (time stop).
+//
+// The table also shows the BASE RATE on your data: how often qualifying gaps
+// reached 50% and 100% fill before the time stop, whether or not a trade was taken.
+// ─────────────────────────────────────────────────────────────────────────────
+
+string TZ = "America/New_York"
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpG = "Gap filter"
+minGap     = input.float(0.10, "Min gap (%)", minval = 0.0, step = 0.05, group = grpG)
+maxGap     = input.float(0.60, "Max gap (%)", minval = 0.05, step = 0.05, group = grpG, tooltip = "Big gaps are usually news-driven and fill much less often.")
+insideOnly = input.bool(true, "Only when the open is inside the prior day's range", group = grpG)
+
+grpE = "Entry"
+confirm = input.bool(true, "Wait for the first 5-min candle to close in the fill direction", group = grpE)
+
+grpX = "Exits"
+tp1Frac     = input.float(0.5, "Target 1 = fraction of the gap filled", minval = 0.1, maxval = 0.9, step = 0.05, group = grpX)
+qty1        = input.int(1, "Contracts to target 1", minval = 1, group = grpX)
+qty2        = input.int(1, "Contracts to target 2 (full fill)", minval = 0, group = grpX)
+moveBE      = input.bool(true, "Runner stop to breakeven after target 1", group = grpX)
+stopTicks   = input.int(4, "Stop buffer beyond first candle (ticks)", minval = 0, group = grpX)
+minStopPct  = input.float(0.08, "Minimum stop (% of price)", minval = 0.0, step = 0.01, group = grpX, tooltip = "0.08% ≈ 17 pts on NQ at 21,000, ≈ 5 pts on ES at 6,000.")
+maxRiskMult = input.float(1.0, "Max stop vs. distance to full fill (×)", minval = 0.25, step = 0.25, group = grpX, tooltip = "Skip the trade if the stop is larger than this multiple of the distance to the prior close.")
+timeStop    = input.session("1130-1600", "Time stop: close anything open after", group = grpX)
+
+grpD = "Display"
+showStats = input.bool(true, "Show results table", group = grpD)
+sigCol    = input.color(#FFFF00, "Entry candle", group = grpD)
+
+if timeframe.in_seconds() > 300
+    runtime.error("Use a 1–5 minute chart.")
+
+// ── Sessions ─────────────────────────────────────────────────────────────────
+inSess(string s) => not na(time(timeframe.period, s, TZ))
+bool inRTH     = inSess("0930-1600")
+bool rthStart  = inRTH and not inRTH[1]
+bool rthEnd    = not inRTH and inRTH[1]
+bool inFirst   = inSess("0930-0935")
+bool firstDone = inFirst and hour(time_close, TZ) == 9 and minute(time_close, TZ) == 35
+bool inLate    = inSess(timeStop)
+bool lateStart = inLate and not inLate[1]
+
+// Prior RTH day
+var float rH = na
+var float rL = na
+var float rC = na
+var float pdH = na
+var float pdL = na
+var float pdC = na
+if rthStart
+    rH := high
+    rL := low
+else if inRTH
+    rH := math.max(rH, high)
+    rL := math.min(rL, low)
+if inRTH
+    rC := close
+if rthEnd
+    pdH := rH
+    pdL := rL
+    pdC := rC
+
+// Today's gap and first 5-min candle
+var float O    = na
+var float gap  = na
+var bool  qual = false
+var float fH   = na
+var float fL   = na
+if rthStart
+    O   := open
+    gap := O - pdC
+    float gp = na(pdC) ? na : math.abs(gap) / pdC * 100
+    qual := not na(gp) and gp >= minGap and gp <= maxGap and (not insideOnly or (O < pdH and O > pdL))
+    fH  := high
+    fL  := low
+else if inFirst
+    fH := math.max(fH, high)
+    fL := math.min(fL, low)
+
+// ── Base rate: how often do qualifying gaps fill? ────────────────────────────
+var int  gapDays = 0
+var int  fill50  = 0
+var int  fillAll = 0
+var bool trk = false
+var bool t50 = false
+var bool tAll = false
+if rthStart
+    trk  := qual
+    t50  := false
+    tAll := false
+if trk and inRTH and not inLate
+    float half = O - gap * tp1Frac
+    if gap > 0 ? low <= half : high >= half
+        t50 := true
+    if gap > 0 ? low <= pdC : high >= pdC
+        tAll := true
+if trk and (lateStart or rthEnd)
+    gapDays += 1
+    fill50  += t50 ? 1 : 0
+    fillAll += tAll ? 1 : 0
+    trk := false
+
+// ── Trade decision at the close of the 09:30 five-minute candle ──────────────
+var float slPx  = na
+var float tp1Px = na
+var float tp2Px = na
+var int   tDir  = 0
+float buf = stopTicks * syminfo.mintick
+
+if firstDone and qual and strategy.opentrades == 0
+    int   d        = gap > 0 ? -1 : 1
+    bool  candleOk = not confirm or (d == 1 ? close > O : close < O)
+    float e        = close
+    float distAll  = (pdC - e) * d                     // > 0 while the gap is still open
+    if candleOk and distAll > 0
+        float half = O - gap * tp1Frac
+        float tp1  = (half - e) * d > 0 ? half : e + d * distAll * 0.5
+        float minS = e * minStopPct / 100
+        float st   = d == 1 ? math.min(fL, e - minS) - buf : math.max(fH, e + minS) + buf
+        float risk = math.abs(e - st)
+        if risk <= maxRiskMult * distAll
+            tDir  := d
+            slPx  := st
+            tp1Px := tp1
+            tp2Px := pdC
+            strategy.entry("Gap 1", d == 1 ? strategy.long : strategy.short, qty = qty1)
+            strategy.exit("Gap 1 x", "Gap 1", stop = st, limit = tp1)
+            if qty2 > 0
+                strategy.entry("Gap 2", d == 1 ? strategy.long : strategy.short, qty = qty2)
+                strategy.exit("Gap 2 x", "Gap 2", stop = st, limit = pdC)
+
+// Runner to breakeven once target 1 has filled.
+if moveBE and qty2 > 0 and strategy.opentrades > 0 and math.abs(strategy.position_size) < qty1 + qty2
+    strategy.exit("Gap 2 x", "Gap 2", stop = strategy.position_avg_price, limit = tp2Px)
+
+if lateStart and strategy.opentrades > 0
+    strategy.close_all("Time stop")
+
+// ── Stars & bracket ──────────────────────────────────────────────────────────
+var box   brRisk = na
+var box   brRew  = na
+var line  brTp1  = na
+var bool  brLive = false
+var float netAtEntry = 0.0
+
+int  totTrades = strategy.opentrades + strategy.closedtrades
+bool newFill   = totTrades > nz(totTrades[1])
+if newFill
+    netAtEntry := nz(strategy.netprofit[1])
+    float ep  = strategy.opentrades > 0 ? strategy.opentrades.entry_price(0) : strategy.closedtrades.entry_price(strategy.closedtrades - 1)
+    float far = qty2 > 0 ? tp2Px : tp1Px
+    brRisk := box.new(bar_index, math.max(ep, slPx), bar_index + 1, math.min(ep, slPx), border_color = color.new(#f23645, 30), bgcolor = color.new(#f23645, 78))
+    brRew  := box.new(bar_index, math.max(ep, far), bar_index + 1, math.min(ep, far), border_color = color.new(#089981, 30), bgcolor = color.new(#089981, 78))
+    brTp1  := line.new(bar_index, tp1Px, bar_index + 1, tp1Px, color = #00e676, style = line.style_dashed)
+    float rk = math.abs(ep - slPx)
+    string info = (tDir == 1 ? "LONG (gap down)" : "SHORT (gap up)") + " @ " + str.tostring(ep, format.mintick) + "\nTP2 full fill " + str.tostring(tp2Px, format.mintick) + "  (" + str.tostring(math.abs(tp2Px - ep) / rk, "#.0") + "R)" + "\nTP1 " + str.tostring(tp1Frac * 100, "#") + "% fill " + str.tostring(tp1Px, format.mintick) + "  (" + str.tostring(math.abs(tp1Px - ep) / rk, "#.0") + "R)" + "\nSL " + str.tostring(slPx, format.mintick) + "  (" + str.tostring(rk, "#.##") + " pts)"
+    label.new(bar_index, tDir == 1 ? math.max(ep, far) : math.min(ep, far), info, style = tDir == 1 ? label.style_label_down : label.style_label_up, color = color.new(color.black, 20), textcolor = color.white, size = size.small, textalign = text.align_left)
+    brLive := true
+if brLive and strategy.opentrades > 0
+    brRisk.set_right(bar_index + 1)
+    brRew.set_right(bar_index + 1)
+    brTp1.set_x2(bar_index + 1)
+if brLive and strategy.opentrades == 0
+    brRisk.set_right(bar_index)
+    brRew.set_right(bar_index)
+    brTp1.set_x2(bar_index)
+    float pnl = strategy.netprofit - netAtEntry
+    label.new(bar_index, tDir == 1 ? high : low, (pnl >= 0 ? "✔ +$" : "✖ -$") + str.tostring(math.abs(pnl), "#,###"), style = tDir == 1 ? label.style_label_down : label.style_label_up, color = pnl >= 0 ? #089981 : #f23645, textcolor = color.white, size = size.tiny)
+    brLive := false
+
+plotchar(newFill and tDir == 1,  "Long entry ★",  "★", location.belowbar, color.new(#00e676, 0), size = size.normal)
+plotchar(newFill and tDir == -1, "Short entry ★", "★", location.abovebar, color.new(#ff1744, 0), size = size.normal)
+barcolor(newFill ? sigCol : na, title = "Entry candle")
+
+// Prior close (the gap-fill target) and today's open on qualifying days
+plot(inRTH and qual ? pdC : na, "Prior close (gap target)", color.new(#00e676, 0), 2, plot.style_linebr)
+plot(inRTH and qual ? O : na, "RTH open", color.new(color.white, 50), 1, plot.style_linebr)
+bgcolor(rthStart and qual ? color.new(color.yellow, 85) : na, title = "Qualifying gap day")
+
+// ── Results ──────────────────────────────────────────────────────────────────
+var table tbl = table.new(position.top_right, 2, 10, bgcolor = color.new(color.black, 75), border_width = 1)
+cellRow(int r, string k, string v, color c) =>
+    tbl.cell(0, r, k, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    tbl.cell(1, r, v, text_color = c, text_size = size.small)
+pct(int a, int b) => b > 0 ? str.tostring(100.0 * a / b, "#.0") + "%" : "–"
+if showStats and barstate.islast
+    int   n  = strategy.closedtrades
+    int   w  = strategy.wintrades
+    float pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    bool  idx = syminfo.root == "NQ" or syminfo.root == "MNQ" or syminfo.root == "ES" or syminfo.root == "MES"
+    cellRow(0, "GAP FILL — " + syminfo.ticker, idx ? "" : "built for NQ/ES", color.orange)
+    cellRow(1, "Qualifying gap days", str.tostring(gapDays), color.white)
+    cellRow(2, "Reached " + str.tostring(tp1Frac * 100, "#") + "% fill by time stop", pct(fill50, gapDays), color.yellow)
+    cellRow(3, "Reached full fill by time stop", pct(fillAll, gapDays), color.yellow)
+    cellRow(4, "Strategy trades (legs)", str.tostring(n), color.white)
+    cellRow(5, "Win rate", pct(w, n), n > 0 and 100.0 * w / n >= 50 ? color.lime : color.orange)
+    cellRow(6, "Profit factor", na(pf) ? "–" : str.tostring(pf, "#.00"), na(pf) ? color.gray : pf >= 1 ? color.lime : color.red)
+    cellRow(7, "Net P&L ($)", str.tostring(strategy.netprofit, "#,###"), strategy.netprofit >= 0 ? color.lime : color.red)
+    cellRow(8, "Max drawdown ($)", str.tostring(strategy.max_drawdown, "#,###"), color.white)
+    cellRow(9, "Avg trade ($)", n > 0 ? str.tostring(strategy.netprofit / n, "#,###") : "–", color.white)
+
+alertcondition(firstDone and qual, "Qualifying gap", "Qualifying gap on {{ticker}}: watch for the gap-fill entry")
+alertcondition(newFill, "Gap fill entry", "Gap-fill entry filled on {{ticker}} @ {{close}}")
