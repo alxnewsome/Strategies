@@ -119,3 +119,13 @@ The same strategy as above, using the **09:30–09:45 ET fifteen-minute candle**
 
 - **Unchanged:** the stop rule (far end of the wick, minimum 15 pts), the liquidity targets, the brackets and the results table.
 - **Chart:** built for the 15-minute chart. It also runs on 1/3/5-minute charts, rebuilding the 15-minute candle from the smaller bars.
+
+## `opening_price_sweep.pine`: Opening Price Sweep (Pine Script v6 indicator)
+
+Marks when price **sweeps the day's opening price**: it trades through the open to take the stops resting there, then closes back on the side it came from. Works on any stock, ETF or future, on any intraday chart. The open comes from the symbol's own regular session, or the full session if you choose.
+
+- **Bullish sweep ▲:** price was holding above the open (it had moved at least 1× ATR away), wicks below it, and closes back above.
+- **Bearish sweep ▼:** price was holding below the open, wicks above it, and closes back below.
+- **Failed breaks (optional):** set `Closes allowed past the open` to 1–3 to also count a failed break, where price closes past the open for a few bars and then closes back.
+- **Chart:** the sweep candle is painted bright yellow, and the opening price is drawn as a line with a label.
+- **Alerts:** bullish, bearish, or either.
