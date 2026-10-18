@@ -162,3 +162,11 @@ Fades small opening gaps back toward the prior 16:00 ET close.
 - **Exits:** half the position at a 50% gap fill, the runner at the full fill with its stop moved to breakeven. A time stop closes everything at 11:30 ET.
 - **On the chart:** green/red ★ entries and a drawn bracket (stop, TP1, TP2) on every trade.
 - **Results table:** shows the **base rate** (how often qualifying gaps reached 50% and 100% fill on your data) next to the strategy's win rate, profit factor, drawdown and average trade.
+
+## `ema9_vwap_cross_strategy.pine`: 9 EMA × VWAP Cross, 1:3 (Pine Script v6 **strategy**)
+
+- **Long** when the 9 EMA crosses above VWAP and **short** when it crosses below, confirmed at the candle close. Entry is at that close.
+- **Fixed 1:3 bracket:** NQ/MNQ 25 pt stop / 75 pt target; ES/MES 10 pt stop / 30 pt target. The symbol is detected automatically.
+- **One trade at a time.** Optional session and end-of-day filters are off by default.
+- **On the chart:** ★ entries, red/green bracket boxes, and ✔/✖ results.
+- **Results table:** win rate against the 25% breakeven, profit factor, net P&L, drawdown and average trade.

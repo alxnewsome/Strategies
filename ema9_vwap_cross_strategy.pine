@@ -1,0 +1,128 @@
+//@version=6
+strategy("9 EMA × VWAP Cross — 1:3", shorttitle = "EMA9×VWAP 1:3", overlay = true, process_orders_on_close = true, initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.cash_per_contract, commission_value = 2.5, slippage = 1, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rules
+//  • LONG  when the 9 EMA crosses ABOVE VWAP, confirmed at the candle close.
+//  • SHORT when the 9 EMA crosses BELOW VWAP, confirmed at the candle close.
+//  • Entry at the close of the confirming candle.
+//  • Fixed 1:3 bracket:  NQ / MNQ → 25 pt stop, 75 pt target
+//                        ES / MES → 10 pt stop, 30 pt target
+//  • One trade at a time. Crosses while a trade is open are ignored.
+// ─────────────────────────────────────────────────────────────────────────────
+
+string TZ = "America/New_York"
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpR = "Risk"
+nqStop    = input.float(25.0, "NQ / MNQ stop (points)", minval = 0.25, step = 0.25, group = grpR)
+esStop    = input.float(10.0, "ES / MES stop (points)", minval = 0.25, step = 0.25, group = grpR)
+otherStop = input.float(10.0, "Other symbols stop (points)", minval = 0.01, group = grpR)
+rr        = input.float(3.0, "Reward : risk", minval = 0.5, step = 0.5, group = grpR)
+qty       = input.int(1, "Contracts", minval = 1, group = grpR)
+
+grpS = "Signals"
+emaLen     = input.int(9, "EMA length", minval = 1, group = grpS)
+vwapAnchor = input.string("Session", "VWAP anchor", options = ["Session", "RTH (09:30 ET)"], group = grpS, tooltip = "Session = TradingView's standard VWAP (resets at the 18:00 ET futures open). RTH = resets at 09:30 ET.")
+allowLong  = input.bool(true, "Take longs", group = grpS)
+allowShort = input.bool(true, "Take shorts", group = grpS)
+
+grpF = "Optional filters (off = pure crossover)"
+useSess  = input.bool(false, "Only enter during a session", group = grpF)
+sess     = input.session("0930-1545", "Entry session (New York)", group = grpF)
+flatEOD  = input.bool(false, "Close open trades at a set time", group = grpF)
+flatSess = input.session("1555-1600", "Close-all time (New York)", group = grpF)
+
+// ── Core ─────────────────────────────────────────────────────────────────────
+string root = syminfo.root
+bool  isNQ  = root == "NQ" or root == "MNQ"
+bool  isES  = root == "ES" or root == "MES"
+float stopPts = isNQ ? nqStop : isES ? esStop : otherStop
+float tgtPts  = stopPts * rr
+
+bool  inRTH    = not na(time(timeframe.period, "0930-1600", TZ))
+bool  rthStart = inRTH and not inRTH[1]
+float vw  = vwapAnchor == "Session" ? ta.vwap(hlc3) : ta.vwap(hlc3, rthStart)
+float ema = ta.ema(close, emaLen)
+
+bool crossUp = ta.crossover(ema, vw)
+bool crossDn = ta.crossunder(ema, vw)
+bool sessOk  = not useSess or not na(time(timeframe.period, sess, TZ))
+bool flat    = strategy.position_size == 0
+
+bool goLong  = barstate.isconfirmed and crossUp and allowLong and sessOk and flat
+bool goShort = barstate.isconfirmed and crossDn and allowShort and sessOk and flat
+
+var float slPx = na
+var float tpPx = na
+var int   tDir = 0
+if goLong
+    tDir := 1
+    slPx := close - stopPts
+    tpPx := close + tgtPts
+    strategy.entry("Long", strategy.long, qty = qty)
+    strategy.exit("Long bracket", "Long", stop = slPx, limit = tpPx)
+if goShort
+    tDir := -1
+    slPx := close + stopPts
+    tpPx := close - tgtPts
+    strategy.entry("Short", strategy.short, qty = qty)
+    strategy.exit("Short bracket", "Short", stop = slPx, limit = tpPx)
+
+if flatEOD and not na(time(timeframe.period, flatSess, TZ)) and not flat
+    strategy.close_all("Time exit")
+
+// ── Bracket drawing ──────────────────────────────────────────────────────────
+var box   brRisk = na
+var box   brRew  = na
+var bool  brLive = false
+var float netAtEntry = 0.0
+
+int  totTrades = strategy.opentrades + strategy.closedtrades
+bool newFill   = totTrades > nz(totTrades[1])
+if newFill
+    netAtEntry := nz(strategy.netprofit[1])
+    float ep = strategy.opentrades > 0 ? strategy.opentrades.entry_price(0) : strategy.closedtrades.entry_price(strategy.closedtrades - 1)
+    // Orders fill at the signal candle's close, so the trade shows up on the next bar: anchor the bracket one bar back.
+    brRisk := box.new(bar_index - 1, math.max(ep, slPx), bar_index + 1, math.min(ep, slPx), border_color = color.new(#f23645, 30), bgcolor = color.new(#f23645, 78))
+    brRew  := box.new(bar_index - 1, math.max(ep, tpPx), bar_index + 1, math.min(ep, tpPx), border_color = color.new(#089981, 30), bgcolor = color.new(#089981, 78))
+    string info = (tDir == 1 ? "LONG" : "SHORT") + " @ " + str.tostring(ep, format.mintick) + "\nTP " + str.tostring(tpPx, format.mintick) + "  (+" + str.tostring(tgtPts, "#.##") + " pts)" + "\nSL " + str.tostring(slPx, format.mintick) + "  (-" + str.tostring(stopPts, "#.##") + " pts)"
+    label.new(bar_index - 1, tpPx, info, style = tDir == 1 ? label.style_label_down : label.style_label_up, color = color.new(color.black, 20), textcolor = color.white, size = size.small, textalign = text.align_left)
+    brLive := true
+if brLive and strategy.opentrades > 0
+    brRisk.set_right(bar_index + 1)
+    brRew.set_right(bar_index + 1)
+if brLive and strategy.opentrades == 0
+    brRisk.set_right(bar_index)
+    brRew.set_right(bar_index)
+    float pnl = strategy.netprofit - netAtEntry
+    label.new(bar_index, tDir == 1 ? high : low, (pnl >= 0 ? "✔ +$" : "✖ -$") + str.tostring(math.abs(pnl), "#,###"), style = tDir == 1 ? label.style_label_down : label.style_label_up, color = pnl >= 0 ? #089981 : #f23645, textcolor = color.white, size = size.tiny)
+    brLive := false
+
+// ── Visuals ──────────────────────────────────────────────────────────────────
+plot(ema, "9 EMA", color.new(#ffd600, 0), 2)
+plot(vw,  "VWAP",  color.new(#00bcd4, 0), 2)
+plotchar(goLong,  "Long entry ★",  "★", location.belowbar, color.new(#00e676, 0), size = size.normal)
+plotchar(goShort, "Short entry ★", "★", location.abovebar, color.new(#ff1744, 0), size = size.normal)
+
+var table tbl = table.new(position.top_right, 2, 8, bgcolor = color.new(color.black, 75), border_width = 1)
+cellRow(int r, string k, string v, color c) =>
+    tbl.cell(0, r, k, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    tbl.cell(1, r, v, text_color = c, text_size = size.small)
+if barstate.islast
+    int   n  = strategy.closedtrades
+    int   w  = strategy.wintrades
+    float wr = n > 0 ? 100.0 * w / n : na
+    float be = 100.0 / (1 + rr)
+    float pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    cellRow(0, "EMA9 × VWAP — " + syminfo.ticker, isNQ or isES ? "" : "not NQ/ES", color.orange)
+    cellRow(1, "Bracket", str.tostring(stopPts, "#.##") + " / " + str.tostring(tgtPts, "#.##") + " pts", color.white)
+    cellRow(2, "Trades", str.tostring(n), color.white)
+    cellRow(3, "Win rate (breakeven " + str.tostring(be, "#") + "%)", n > 0 ? str.tostring(wr, "#.0") + "%" : "–", n == 0 ? color.gray : wr > be ? color.lime : color.red)
+    cellRow(4, "Profit factor", na(pf) ? "–" : str.tostring(pf, "#.00"), na(pf) ? color.gray : pf >= 1 ? color.lime : color.red)
+    cellRow(5, "Net P&L ($)", str.tostring(strategy.netprofit, "#,###"), strategy.netprofit >= 0 ? color.lime : color.red)
+    cellRow(6, "Max drawdown ($)", str.tostring(strategy.max_drawdown, "#,###"), color.white)
+    cellRow(7, "Avg trade ($)", n > 0 ? str.tostring(strategy.netprofit / n, "#,###") : "–", color.white)
+
+alertcondition(goLong,  "Long entry",  "9 EMA crossed above VWAP on {{ticker}} @ {{close}}: LONG")
+alertcondition(goShort, "Short entry", "9 EMA crossed below VWAP on {{ticker}} @ {{close}}: SHORT")
